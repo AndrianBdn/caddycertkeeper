@@ -2,10 +2,13 @@ package caddycertkeeper
 
 import (
 	"crypto/md5" // #nosec G501 -- S3 computes ETags this way; nothing here is security
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -17,14 +20,23 @@ import (
 	"go.uber.org/zap"
 )
 
-// fakeS3 is an in-memory, path-style S3 endpoint holding single objects. It
-// applies each request atomically and honours If-None-Match: * and If-Match
-// on PUT the way S3 and S3-compatible services with conditional writes do.
+// fakeS3 is an in-memory, path-style S3 endpoint for one bucket. It applies
+// each request atomically, honours If-None-Match: * and If-Match on PUT the
+// way S3 and S3-compatible services with conditional writes do, and lists
+// objects (ListObjectsV2) with prefix, delimiter and pagination.
 type fakeS3 struct {
 	t *testing.T
 
 	mu      sync.Mutex
 	objects map[string]*fakeObject
+
+	// pageSize caps the keys and common prefixes in one listing page.
+	pageSize int
+
+	// afterGet runs after a GET of an object is answered and before any
+	// other request is served, with mu held: what it does to the bucket is
+	// what another instance did between a reader's GET and its next request.
+	afterGet func(key string)
 
 	// ignoreDeleteIfMatch deletes regardless of If-Match, as services that
 	// do not support conditional deletes do.
@@ -39,7 +51,7 @@ type fakeObject struct {
 
 func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
 	t.Helper()
-	f := &fakeS3{t: t, objects: make(map[string]*fakeObject)}
+	f := &fakeS3{t: t, objects: make(map[string]*fakeObject), pageSize: 1000}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv
@@ -89,6 +101,11 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2" {
+		f.list(w, r)
+		return
+	}
 	obj, exists := f.objects[key]
 
 	switch r.Method {
@@ -129,6 +146,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		if r.Method == http.MethodGet {
 			_, _ = w.Write(obj.body)
+			if f.afterGet != nil {
+				f.afterGet(key)
+			}
 		}
 
 	case http.MethodDelete:
@@ -141,6 +161,88 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// list answers ListObjectsV2. Keys and common prefixes are returned in one
+// sorted sequence, pageSize entries at a time, as S3 does.
+func (f *fakeS3) list(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	prefix, delimiter, after := q.Get("prefix"), q.Get("delimiter"), q.Get("continuation-token")
+
+	type entry struct {
+		name     string
+		isPrefix bool
+	}
+	var entries []entry
+	seen := map[string]bool{}
+	for key := range f.objects {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if delimiter != "" {
+			if i := strings.Index(key[len(prefix):], delimiter); i >= 0 {
+				common := key[:len(prefix)+i+len(delimiter)]
+				if !seen[common] {
+					seen[common] = true
+					entries = append(entries, entry{common, true})
+				}
+				continue
+			}
+		}
+		entries = append(entries, entry{key, false})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+
+	type content struct {
+		Key          string
+		LastModified string
+		ETag         string
+		Size         int
+	}
+	type commonPrefix struct {
+		Prefix string
+	}
+	result := struct {
+		XMLName               xml.Name `xml:"ListBucketResult"`
+		Name                  string
+		Prefix                string
+		Delimiter             string `xml:",omitempty"`
+		KeyCount              int
+		IsTruncated           bool
+		NextContinuationToken string `xml:",omitempty"`
+		Contents              []content
+		CommonPrefixes        []commonPrefix
+	}{Name: "test", Prefix: prefix, Delimiter: delimiter}
+
+	pageSize := f.pageSize
+	if n, err := strconv.Atoi(q.Get("max-keys")); err == nil && n < pageSize {
+		pageSize = n
+	}
+	for _, e := range entries {
+		if after != "" && e.name <= after {
+			continue
+		}
+		if result.KeyCount == pageSize {
+			result.IsTruncated = true
+			break
+		}
+		result.KeyCount++
+		result.NextContinuationToken = e.name
+		if e.isPrefix {
+			result.CommonPrefixes = append(result.CommonPrefixes, commonPrefix{e.name})
+			continue
+		}
+		obj := f.objects[e.name]
+		result.Contents = append(result.Contents, content{e.name, obj.modified.UTC().Format(time.RFC3339Nano), obj.etag, len(obj.body)})
+	}
+	if !result.IsTruncated {
+		result.NextContinuationToken = ""
+	}
+
+	w.Header().Set("Content-Type", "application/xml")
+	if err := xml.NewEncoder(w).Encode(result); err != nil {
+		f.t.Errorf("fake s3: encoding listing: %v", err)
 	}
 }
 

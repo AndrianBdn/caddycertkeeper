@@ -1,6 +1,7 @@
 package caddycertkeeper
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
@@ -24,9 +26,13 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 var ErrInvalidKey = errors.New("invalid key")
+
+// defaultRegion is used when no region is configured anywhere.
+const defaultRegion = "us-east-1"
 
 type S3 struct {
 	Logger *zap.Logger
@@ -45,10 +51,34 @@ type S3 struct {
 	Prefix       string `json:"prefix"`
 	UsePathStyle bool   `json:"use_path_style,omitempty"`
 
-	// EncryptionKey is optional. If you do not wish to encrypt your certficates and key inside the S3 bucket, leave it empty.
+	// EncryptionKey is optional. If you do not wish to encrypt your certificates and keys inside the S3 bucket, leave it empty.
+	// It encrypts everything written and is tried first when reading. It is written either as "base64:"
+	// followed by the base64 of the 32 bytes of the key, or as exactly 32 bytes of text, which are then the
+	// key as they are. The key is used directly: nothing stretches a weak one.
 	EncryptionKey string `json:"encryption_key"`
 
+	// OldEncryptionKeys are former values of EncryptionKey. They are never used to encrypt; when EncryptionKey
+	// does not decrypt an object, each of them is tried in order. This makes changing EncryptionKey a rolling
+	// change: instances that have the new key keep reading what was written under the old ones.
+	OldEncryptionKeys []string `json:"old_encryption_keys,omitempty"`
+
+	// EncryptionKeySSM reads the encryption keys from AWS Systems Manager Parameter Store instead of the
+	// config: each entry is the name or ARN of a parameter (a SecureString, ideally) whose value is one
+	// key, written as in EncryptionKey. The first parameter's key encrypts; the others are old keys, tried in order when reading.
+	// The parameters are read once, when the storage is provisioned, with the region and credentials the
+	// S3 client uses. It cannot be combined with EncryptionKey.
+	EncryptionKeySSM []string `json:"encryption_key_ssm,omitempty"`
+
+	// EncryptionKeyFile reads the encryption keys from files instead of the config: each entry is the path
+	// of a file holding one key: its 32 raw bytes, or the key as written in EncryptionKey. The first
+	// file's key encrypts; the others are old keys, tried in order when reading. The files are read once,
+	// when the storage is provisioned. It cannot be combined with EncryptionKey or EncryptionKeySSM.
+	EncryptionKeyFile []string `json:"encryption_key_file,omitempty"`
+
 	iowrap IO
+
+	// ssmClient replaces the SSM client built from the AWS config; tests set it.
+	ssmClient ssmAPI
 
 	locksMu sync.Mutex
 	locks   map[string]*heldLock
@@ -61,23 +91,51 @@ func init() {
 func (s3 *S3) Provision(ctx caddy.Context) error {
 	s3.Logger = ctx.Logger(s3)
 
+	if err := s3.checkConfig(); err != nil {
+		return err
+	}
+
+	cfg, err := s3.loadAWSConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create S3 client: %w", err)
+	}
+	s3.Client = s3.newS3Client(cfg)
+
+	keys, err := s3.encryptionKeys(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	s3.setupEncryption(keys)
+	return nil
+}
+
+// checkConfig does for every config what the Caddyfile parser does for its
+// own, as far as that cannot move an existing setup: a config written as
+// JSON never passes through the parser. The parser's "acme" prefix and its
+// path-style addressing for custom endpoints are not applied here, because
+// JSON setups that work today depend on not having them.
+func (s3 *S3) checkConfig() error {
+	if s3.Bucket == "" {
+		return errors.New("bucket is required")
+	}
+
 	if s3.Host != "" {
+		// A Caddyfile with 'host' arrives here with the endpoint already
+		// derived from it; a JSON config with 'host' does not.
+		if s3.Endpoint == "" {
+			s3.Endpoint = "https://" + s3.Host
+		}
 		s3.Logger.Info("Using deprecated 'host' option, consider switching to 'endpoint'",
 			zap.String("host", s3.Host),
 			zap.String("endpoint", s3.Endpoint),
 		)
 	}
-
-	client, err := s3.buildS3Client()
-	if err != nil {
-		return fmt.Errorf("failed to create S3 client: %w", err)
-	}
-
-	s3.Client = client
-	return s3.setupEncryption()
+	return nil
 }
 
-func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
+// loadAWSConfig resolves the region and credentials. The S3 client and, when
+// the encryption keys are kept there, the SSM client are both built from it.
+func (s3 *S3) loadAWSConfig(ctx context.Context) (aws.Config, error) {
 	configOptions := []func(*config.LoadOptions) error{
 		config.WithRegion(s3.Region),
 	}
@@ -90,14 +148,7 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 
 	if s3.Insecure {
 		s3.Logger.Warn("TLS certificate verification is disabled - this is insecure and should only be used for testing")
-		httpClient := &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true, // #nosec G402
-				},
-			},
-		}
-		configOptions = append(configOptions, config.WithHTTPClient(httpClient))
+		configOptions = append(configOptions, config.WithHTTPClient(insecureHTTPClient()))
 	}
 
 	if s3.AccessKey != "" && s3.SecretKey != "" {
@@ -107,10 +158,17 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 		configOptions = append(configOptions, config.WithSharedConfigProfile(s3.Profile))
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.Background(), configOptions...)
+	cfg, err := config.LoadDefaultConfig(ctx, configOptions...)
 	if err != nil {
-		return nil, err
+		return aws.Config{}, err
 	}
+
+	// A JSON config may leave the region to the environment or the shared
+	// config; when nothing names one, use the same default as the Caddyfile.
+	if cfg.Region == "" {
+		cfg.Region = defaultRegion
+	}
+	s3.Region = cfg.Region
 
 	if s3.RoleARN != "" {
 		stsClient := sts.NewFromConfig(cfg)
@@ -118,6 +176,22 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 		cfg.Credentials = aws.NewCredentialsCache(provider)
 	}
 
+	return cfg, nil
+}
+
+// insecureHTTPClient is the SDK's own HTTP client with certificate
+// verification switched off and nothing else changed: it keeps the proxy
+// settings from the environment and the timeouts, idle connections included.
+func insecureHTTPClient() *awshttp.BuildableClient {
+	return awshttp.NewBuildableClient().WithTransportOptions(func(tr *http.Transport) {
+		if tr.TLSClientConfig == nil {
+			tr.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		tr.TLSClientConfig.InsecureSkipVerify = true // #nosec G402 -- what the 'insecure' option asks for
+	})
+}
+
+func (s3 *S3) newS3Client(cfg aws.Config) *s3sdk.Client {
 	var s3Options []func(*s3sdk.Options)
 
 	if s3.Endpoint != "" {
@@ -132,24 +206,39 @@ func (s3 *S3) buildS3Client() (*s3sdk.Client, error) {
 		})
 	}
 
-	return s3sdk.NewFromConfig(cfg, s3Options...), nil
+	return s3sdk.NewFromConfig(cfg, s3Options...)
 }
 
-func (s3 *S3) setupEncryption() error {
-	if len(s3.EncryptionKey) == 0 {
-		s3.Logger.Info("Clear text certificate storage active")
-		s3.iowrap = &CleartextIO{}
-	} else if len(s3.EncryptionKey) != 32 {
-		s3.Logger.Error("encryption key must have exactly 32 bytes")
-		return errors.New("encryption key must have exactly 32 bytes")
-	} else {
-		s3.Logger.Info("Encrypted certificate storage active")
-		sb := &SecretBoxIO{}
-		copy(sb.SecretKey[:], []byte(s3.EncryptionKey))
-		s3.iowrap = sb
+// MarshalLogObject is what a logger writes for this storage. certmagic logs
+// its storage whole (zap.Any("storage", storage)) on every storage clean;
+// without this method zap falls back to reflection and writes every field,
+// credentials and encryption keys included.
+func (s3 *S3) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("module", "caddy.storage.s3")
+	enc.AddString("endpoint", s3.Endpoint)
+	enc.AddString("bucket", s3.Bucket)
+	enc.AddString("region", s3.Region)
+	enc.AddString("prefix", s3.Prefix)
+	if s3.Profile != "" {
+		enc.AddString("profile", s3.Profile)
 	}
-
+	if s3.RoleARN != "" {
+		enc.AddString("role_arn", s3.RoleARN)
+	}
+	enc.AddBool("static_credentials", s3.AccessKey != "" && s3.SecretKey != "")
+	enc.AddBool("encrypted", s3.keySource() != "")
 	return nil
+}
+
+// String keeps credentials and encryption keys out of anything that formats
+// the storage with %v, %+v or %s.
+func (s3 *S3) String() string {
+	return fmt.Sprintf("s3 storage (endpoint=%q bucket=%q prefix=%q)", s3.Endpoint, s3.Bucket, s3.Prefix)
+}
+
+// GoString does the same for %#v.
+func (s3 *S3) GoString() string {
+	return s3.String()
 }
 
 func (s3 *S3) CaddyModule() caddy.ModuleInfo {
@@ -229,13 +318,72 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 	}
 	defer func() { _ = result.Body.Close() }()
 
-	buf, err := io.ReadAll(s3.iowrap.WrapReader(result.Body))
+	stored, err := io.ReadAll(result.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
+	}
+	buf, underOldKey, err := s3.decrypt(stored)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
+	}
+	if underOldKey {
+		s3.reencrypt(ctx, objName, buf, aws.ToString(result.ETag))
 	}
 	return buf, nil
 }
 
+// decrypt opens what was stored, and reports whether it took one of the old
+// encryption keys to do it.
+func (s3 *S3) decrypt(stored []byte) (plain []byte, underOldKey bool, err error) {
+	if sb, ok := s3.iowrap.(*SecretBoxIO); ok {
+		var key int
+		plain, key, err = sb.open(stored)
+		return plain, key > 0, err
+	}
+	plain, err = io.ReadAll(s3.iowrap.WrapReader(bytes.NewReader(stored)))
+	return plain, false, err
+}
+
+// reencrypt stores an object that was just read under an old encryption key
+// again, under the current one, so that the old key is eventually needed for
+// nothing. The write names the ETag that was read: if another instance has
+// replaced or removed the object in the meantime, the service refuses the
+// write and that instance's version stands. No lock is needed for that.
+//
+// It is best effort. The caller has its data either way, and an object that
+// was not rewritten is tried again the next time it is loaded.
+func (s3 *S3) reencrypt(ctx context.Context, objName string, plain []byte, etag string) {
+	if etag == "" {
+		// Without the ETag the write could not be made conditional, and an
+		// unconditional one could undo another instance's write.
+		s3.Logger.Debug("not re-encrypting object: storage returned no ETag for it", zap.String("key", objName))
+		return
+	}
+
+	r := s3.iowrap.ByteReader(plain)
+	_, err := s3.Client.PutObject(ctx, &s3sdk.PutObjectInput{
+		Bucket:        aws.String(s3.Bucket),
+		Key:           aws.String(objName),
+		Body:          &r,
+		ContentLength: aws.Int64(r.Len()),
+		IfMatch:       aws.String(etag),
+	})
+	switch {
+	case err == nil:
+		s3.Logger.Info("re-encrypted object under the current encryption key", zap.String("key", objName))
+	case isPreconditionFailed(err) || isNotFound(err):
+		s3.Logger.Debug("not re-encrypting object: it changed since it was read", zap.String("key", objName))
+	default:
+		s3.Logger.Warn("re-encrypting object under the current encryption key failed",
+			zap.String("key", objName),
+			zap.Error(err),
+		)
+	}
+}
+
+// Delete removes key and, as certmagic requires of a storage, every key
+// under it: a key can be a "directory" of other keys, such as a site's
+// folder of certificate assets or an ECH config's folder.
 func (s3 *S3) Delete(ctx context.Context, key string) error {
 	start := time.Now()
 	objName := s3.objName(key)
@@ -252,18 +400,48 @@ func (s3 *S3) Delete(ctx context.Context, key string) error {
 		)
 	}()
 
-	input := &s3sdk.DeleteObjectInput{
-		Bucket: aws.String(s3.Bucket),
-		Key:    aws.String(objName),
+	// The root of the storage is not something to delete, whatever the key
+	// was meant to be: everything in the bucket lies under it.
+	if isRootKey(key) {
+		return nil
 	}
 
-	_, err := s3.Client.DeleteObject(ctx, input)
-	if err != nil {
+	if err := s3.deleteObject(ctx, objName); err != nil {
 		return fmt.Errorf("failed to delete key %s: %w", key, err)
+	}
+
+	// List everything under the key before deleting any of it.
+	var under []string
+	paginator := s3sdk.NewListObjectsV2Paginator(s3.Client, &s3sdk.ListObjectsV2Input{
+		Bucket: aws.String(s3.Bucket),
+		Prefix: aws.String(s3.objDirName(key)),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to list keys under %s to delete them: %w", key, err)
+		}
+		for _, obj := range page.Contents {
+			under = append(under, aws.ToString(obj.Key))
+		}
+	}
+	for _, name := range under {
+		if err := s3.deleteObject(ctx, name); err != nil {
+			return fmt.Errorf("failed to delete key %s: %w", key, err)
+		}
 	}
 	return nil
 }
 
+func (s3 *S3) deleteObject(ctx context.Context, objName string) error {
+	_, err := s3.Client.DeleteObject(ctx, &s3sdk.DeleteObjectInput{
+		Bucket: aws.String(s3.Bucket),
+		Key:    aws.String(objName),
+	})
+	return err
+}
+
+// Exists reports whether key is an object or a "directory" of other keys.
 func (s3 *S3) Exists(ctx context.Context, key string) bool {
 	objName := s3.objName(key)
 
@@ -272,13 +450,12 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 		zap.String("bucket", s3.Bucket),
 	)
 
-	input := &s3sdk.HeadObjectInput{
-		Bucket: aws.String(s3.Bucket),
-		Key:    aws.String(objName),
+	exists := false
+	if _, err := s3.headObject(ctx, key); err == nil {
+		exists = true
+	} else if isNotFound(err) {
+		_, exists, _ = s3.statDir(ctx, key, 1)
 	}
-
-	_, err := s3.Client.HeadObject(ctx, input)
-	exists := err == nil
 
 	s3.Logger.Debug("existence check completed",
 		zap.String("key", objName),
@@ -288,16 +465,53 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 	return exists
 }
 
-func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
+// headObject looks up the object at key. The root of the storage is never
+// an object, only a directory.
+func (s3 *S3) headObject(ctx context.Context, key string) (*s3sdk.HeadObjectOutput, error) {
+	if isRootKey(key) {
+		return nil, &types.NotFound{}
+	}
+	return s3.Client.HeadObject(ctx, &s3sdk.HeadObjectInput{
+		Bucket: aws.String(s3.Bucket),
+		Key:    aws.String(s3.objName(key)),
+	})
+}
+
+// statDir reports whether any key lies under key, which makes key a
+// "directory", and when the newest of the first maxKeys of them was
+// written.
+func (s3 *S3) statDir(ctx context.Context, key string, maxKeys int32) (modified time.Time, exists bool, err error) {
+	out, err := s3.Client.ListObjectsV2(ctx, &s3sdk.ListObjectsV2Input{
+		Bucket:  aws.String(s3.Bucket),
+		Prefix:  aws.String(s3.objDirName(key)),
+		MaxKeys: aws.Int32(maxKeys),
+	})
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, obj := range out.Contents {
+		if t := aws.ToTime(obj.LastModified); t.After(modified) {
+			modified = t
+		}
+	}
+	return modified, len(out.Contents) > 0, nil
+}
+
+// List returns the keys under path: all of them when recursive, otherwise
+// only the ones directly under it, where a "directory" of further keys is
+// listed once, as a key itself. certmagic and Caddy walk the storage level
+// by level with non-recursive listings.
+func (s3 *S3) List(ctx context.Context, path string, recursive bool) ([]string, error) {
 	var keys []string
 
-	fullPrefix := s3.objName(prefix)
-	if prefix != "" {
-		fullPrefix += "/"
-	}
+	root := s3.objDirName("")
+	dir := s3.objDirName(path)
 	input := &s3sdk.ListObjectsV2Input{
 		Bucket: aws.String(s3.Bucket),
-		Prefix: aws.String(fullPrefix),
+		Prefix: aws.String(dir),
+	}
+	if !recursive {
+		input.Delimiter = aws.String("/")
 	}
 
 	paginator := s3sdk.NewListObjectsV2Paginator(s3.Client, input)
@@ -308,38 +522,58 @@ func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string
 		}
 
 		for _, obj := range result.Contents {
-			key := aws.ToString(obj.Key)
+			name := aws.ToString(obj.Key)
+			if name == dir {
+				// A placeholder object for the directory itself, as S3
+				// consoles create for a "folder": not a key in it.
+				continue
+			}
 			// Strip the configured prefix from the key before appending
-			keys = append(keys, strings.TrimPrefix(key, s3.objName("")))
+			keys = append(keys, strings.TrimPrefix(name, root))
+		}
+		for _, sub := range result.CommonPrefixes {
+			name := strings.TrimSuffix(aws.ToString(sub.Prefix), "/")
+			keys = append(keys, strings.TrimPrefix(name, root))
 		}
 	}
 
 	return keys, nil
 }
 
+// Stat describes key: an object is a terminal key, and a key that other
+// keys lie under is a "directory".
 func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	s3.Logger.Info(fmt.Sprintf("Stat: %v", s3.objName(key)))
-	var ki certmagic.KeyInfo
+	s3.Logger.Debug("stat", zap.String("key", s3.objName(key)))
 
-	input := &s3sdk.HeadObjectInput{
-		Bucket: aws.String(s3.Bucket),
-		Key:    aws.String(s3.objName(key)),
+	head, err := s3.headObject(ctx, key)
+	if err == nil {
+		return certmagic.KeyInfo{
+			Key:        key,
+			Size:       aws.ToInt64(head.ContentLength),
+			Modified:   aws.ToTime(head.LastModified),
+			IsTerminal: true,
+		}, nil
+	}
+	if !isNotFound(err) {
+		return certmagic.KeyInfo{}, err
 	}
 
-	result, err := s3.Client.HeadObject(ctx, input)
+	// Modified is the newest write among the first page of keys under the
+	// directory. certmagic uses it to pick the most recently used ACME
+	// account, whose folder holds two keys.
+	modified, exists, err := s3.statDir(ctx, key, 1000)
 	if err != nil {
-		var nsk *types.NoSuchKey
-		if errors.As(err, &nsk) {
-			return ki, fs.ErrNotExist
-		}
-		return ki, err
+		return certmagic.KeyInfo{}, err
 	}
+	if !exists {
+		return certmagic.KeyInfo{}, fs.ErrNotExist
+	}
+	return certmagic.KeyInfo{Key: key, Modified: modified, IsTerminal: false}, nil
+}
 
-	ki.Key = key
-	ki.Size = aws.ToInt64(result.ContentLength)
-	ki.Modified = aws.ToTime(result.LastModified)
-	ki.IsTerminal = true
-	return ki, nil
+// isRootKey reports whether key names the root of the storage.
+func isRootKey(key string) bool {
+	return strings.Trim(key, "/") == ""
 }
 
 func (s3 *S3) objName(key string) string {
@@ -352,6 +586,16 @@ func (s3 *S3) objName(key string) string {
 	return prefix + "/" + key
 }
 
+// objDirName returns what the names of all objects under key start with.
+// For the root of the storage that is the configured prefix, or nothing.
+func (s3 *S3) objDirName(key string) string {
+	key = strings.Trim(key, "/")
+	if key == "" {
+		return s3.objName("")
+	}
+	return s3.objName(key) + "/"
+}
+
 func (s3 *S3) objLockName(key string) string {
 	return s3.objName(key) + ".lock"
 }
@@ -361,62 +605,120 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 	return s3, nil
 }
 
-func parseBool(value string) (bool, error) {
-	return strconv.ParseBool(value)
-}
-
+// UnmarshalCaddyfile reads the storage block:
+//
+//	s3 {
+//	    <option> <value>
+//	    ...
+//	}
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	for d.Next() {
-		key := d.Val()
-		var value string
-
-		if !d.Args(&value) {
-			continue;
-		}
-
-		switch key {
-		case "host":
-			s3.Host = value
-		case "endpoint":
-			s3.Endpoint = value
-		case "insecure":
-			parsed, err := parseBool(value)
-			if err != nil {
-				return d.Errf("invalid boolean value for 'insecure': %v", err)
-			}
-			s3.Insecure = parsed
-		case "bucket":
-			s3.Bucket = value
-		case "region":
-			s3.Region = value
-		case "access_key":
-			s3.AccessKey = value
-		case "secret_key":
-			s3.SecretKey = value
-		case "profile":
-			s3.Profile = value
-		case "role_arn":
-			s3.RoleARN = value
-		case "prefix":
-			s3.Prefix = value
-		case "encryption_key":
-			if value != "" && len(value) != 32 {
-				return d.Errf("encryption_key must be exactly 32 bytes, got %d", len(value))
-			}
-			s3.EncryptionKey = value
-		case "use_path_style":
-			parsed, err := parseBool(value)
-			if err != nil {
-				return d.Errf("invalid boolean value for 'use_path_style': %v", err)
-			}
-			s3.UsePathStyle = parsed
-		default:
-			return d.Errf("unknown configuration option: %s", key)
+	d.Next() // the module name
+	if d.NextArg() {
+		return d.ArgErr()
+	}
+	for d.NextBlock(0) {
+		if err := s3.setCaddyfileOption(d, d.Val()); err != nil {
+			return err
 		}
 	}
+	return s3.finishCaddyfile(d)
+}
 
+// setCaddyfileOption reads the value, or values, of the option the
+// dispenser is on.
+func (s3 *S3) setCaddyfileOption(d *caddyfile.Dispenser, key string) error {
+	stringOptions := map[string]*string{
+		"host":       &s3.Host,
+		"endpoint":   &s3.Endpoint,
+		"bucket":     &s3.Bucket,
+		"region":     &s3.Region,
+		"access_key": &s3.AccessKey,
+		"secret_key": &s3.SecretKey,
+		"profile":    &s3.Profile,
+		"role_arn":   &s3.RoleARN,
+		"prefix":     &s3.Prefix,
+	}
+	boolOptions := map[string]*bool{
+		"insecure":       &s3.Insecure,
+		"use_path_style": &s3.UsePathStyle,
+	}
+
+	if dst, ok := stringOptions[key]; ok {
+		value, err := oneArg(d)
+		if err != nil {
+			return err
+		}
+		*dst = value
+		return nil
+	}
+	if dst, ok := boolOptions[key]; ok {
+		// A bare 'insecure' is refused rather than read as true: until now
+		// it was skipped, and a config must not lose TLS verification by
+		// being moved to this version.
+		value, err := oneArg(d)
+		if err != nil {
+			return err
+		}
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return d.Errf("invalid boolean value for '%s': %v", key, err)
+		}
+		*dst = parsed
+		return nil
+	}
+
+	return s3.setCaddyfileKeyOption(d, key)
+}
+
+// setCaddyfileKeyOption reads the options that take the current encryption
+// key, or where to find it, followed by any number of old ones.
+func (s3 *S3) setCaddyfileKeyOption(d *caddyfile.Dispenser, key string) error {
+	// encryption_key_file <file> [<old_file>...]
+	// encryption_key_ssm <parameter> [<old_parameter>...]
+	locations := map[string]*[]string{
+		"encryption_key_file": &s3.EncryptionKeyFile,
+		"encryption_key_ssm":  &s3.EncryptionKeySSM,
+	}
+	dst, isLocation := locations[key]
+	if !isLocation && key != "encryption_key" {
+		return d.Errf("unknown configuration option: %s", key)
+	}
+	args := d.RemainingArgs()
+	if len(args) == 0 {
+		return d.ArgErr()
+	}
+
+	if isLocation {
+		for i, name := range args {
+			if name == "" {
+				return d.Errf("%s: name %d is empty", key, i+1)
+			}
+		}
+		*dst = args
+		return nil
+	}
+
+	// encryption_key <key> [<old_key>...]
+	// The keys are checked once the whole block is read.
+	s3.EncryptionKey = args[0]
+	s3.OldEncryptionKeys = append(s3.OldEncryptionKeys, args[1:]...)
+	return nil
+}
+
+// oneArg reads the value of an option that takes exactly one.
+func oneArg(d *caddyfile.Dispenser) (string, error) {
+	var value string
+	if !d.Args(&value) || d.NextArg() {
+		return "", d.ArgErr()
+	}
+	return value, nil
+}
+
+// finishCaddyfile applies the defaults and checks the options against each
+// other once the whole block is read.
+func (s3 *S3) finishCaddyfile(d *caddyfile.Dispenser) error {
 	if s3.Region == "" {
-		s3.Region = "us-east-1"
+		s3.Region = defaultRegion
 	}
 	if s3.Prefix == "" {
 		s3.Prefix = "acme"
@@ -425,14 +727,17 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	if s3.Bucket == "" {
 		return d.Err("bucket is required")
 	}
-
-	if s3.Host != "" && s3.Endpoint != "" {
-		return d.Err("cannot specify both 'host' and 'endpoint' options")
+	if _, err := s3.inlineKeys(); err != nil {
+		return d.Err(err.Error())
 	}
-	if s3.Host != "" && s3.Endpoint == "" {
+
+	if s3.Host != "" {
+		if s3.Endpoint != "" {
+			return d.Err("cannot specify both 'host' and 'endpoint' options")
+		}
 		s3.Endpoint = "https://" + s3.Host
 	}
-	if s3.Endpoint != "" && !s3.UsePathStyle {
+	if s3.Endpoint != "" {
 		s3.UsePathStyle = true
 	}
 
@@ -443,4 +748,8 @@ var (
 	_ caddy.Provisioner      = (*S3)(nil)
 	_ caddy.StorageConverter = (*S3)(nil)
 	_ caddyfile.Unmarshaler  = (*S3)(nil)
+
+	_ zapcore.ObjectMarshaler = (*S3)(nil)
+	_ fmt.Stringer            = (*S3)(nil)
+	_ fmt.GoStringer          = (*S3)(nil)
 )

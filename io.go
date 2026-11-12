@@ -55,7 +55,11 @@ func (ci *CleartextIO) ByteReader(buf []byte) Reader {
 }
 
 type SecretBoxIO struct {
+	// SecretKey encrypts everything written and is tried first when reading.
 	SecretKey [32]byte
+	// OldSecretKeys are tried in order when SecretKey does not decrypt the
+	// data. They are never used to encrypt.
+	OldSecretKeys [][32]byte
 }
 
 func NewSecretBoxIO(key [32]byte) *SecretBoxIO {
@@ -83,23 +87,41 @@ func (sb *SecretBoxIO) WrapReader(r io.Reader) io.Reader {
 		return &Reader{nil, 0, err}
 	}
 
-	if len(allData) == 0 {
-		return bytes.NewReader(nil)
+	bout, _, err := sb.open(allData)
+	if err != nil {
+		return &Reader{nil, 0, err}
 	}
+	return bytes.NewReader(bout)
+}
 
-	if len(allData) < NonceSize {
-		return &Reader{nil, 0, errors.New("insufficient data for decryption: missing nonce")}
+// open decrypts data and reports which key opened it: 0 for SecretKey, n
+// for the nth of OldSecretKeys.
+func (sb *SecretBoxIO) open(data []byte) ([]byte, int, error) {
+	if !sb.IsValid() {
+		return nil, 0, errors.New("SecretBoxIO not properly initialized")
+	}
+	if len(data) == 0 {
+		return nil, 0, nil
+	}
+	if len(data) < NonceSize {
+		return nil, 0, errors.New("insufficient data for decryption: missing nonce")
 	}
 
 	var nonce [NonceSize]byte
-	copy(nonce[:], allData[:NonceSize])
-	encryptedData := allData[NonceSize:]
+	copy(nonce[:], data[:NonceSize])
+	encryptedData := data[NonceSize:]
 
-	bout, ok := secretbox.Open(nil, encryptedData, &nonce, &sb.SecretKey)
-	if !ok {
-		return &Reader{nil, 0, errors.New("decryption failed: invalid key or corrupted data")}
+	// secretbox authenticates the data, so a wrong key fails cleanly and the
+	// next one can be tried.
+	if bout, ok := secretbox.Open(nil, encryptedData, &nonce, &sb.SecretKey); ok {
+		return bout, 0, nil
 	}
-	return bytes.NewReader(bout)
+	for i := range sb.OldSecretKeys {
+		if bout, ok := secretbox.Open(nil, encryptedData, &nonce, &sb.OldSecretKeys[i]); ok {
+			return bout, i + 1, nil
+		}
+	}
+	return nil, 0, errors.New("decryption failed: invalid key or corrupted data")
 }
 
 func (sb *SecretBoxIO) ByteReader(msg []byte) Reader {

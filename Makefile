@@ -8,7 +8,7 @@ test-race:
 
 .PHONY: lint
 lint:
-	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest run
+	go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0 run
 
 .PHONY: fmt
 fmt:

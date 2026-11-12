@@ -1,13 +1,13 @@
-FROM caddy:2.10.0-builder AS builder
+FROM caddy:2.11.9-builder AS builder
 
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /build
 
-COPY . /build/certmagic-s3/
+COPY . /build/caddycertkeeper/
 
 RUN xcaddy build \
-    --with github.com/techknowlogick/certmagic-s3=/build/certmagic-s3
+    --with github.com/AndrianBdn/caddycertkeeper=/build/caddycertkeeper
 
 FROM gcr.io/distroless/static-debian12:latest
 
