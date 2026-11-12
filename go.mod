@@ -1,4 +1,4 @@
-module github.com/techknowlogick/certmagic-s3
+module github.com/AndrianBdn/caddycertkeeper
 
 go 1.26.0
 

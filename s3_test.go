@@ -1,4 +1,4 @@
-package s3
+package caddycertkeeper
 
 import (
 	"testing"

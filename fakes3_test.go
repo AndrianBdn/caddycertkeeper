@@ -1,4 +1,4 @@
-package s3
+package caddycertkeeper
 
 import (
 	"crypto/md5" // #nosec G501 -- S3 computes ETags this way; nothing here is security
