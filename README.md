@@ -1,5 +1,7 @@
 # caddycertkeeper
 
+[![CI](https://github.com/AndrianBdn/caddycertkeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrianBdn/caddycertkeeper/actions/workflows/ci.yml)
+
 S3 storage for [Caddy](https://caddyserver.com) and [CertMagic](https://github.com/caddyserver/certmagic): keep certificates, private keys and ACME accounts in any S3-compatible bucket, share them between instances, and optionally encrypt them on the client with [secretbox](https://pkg.go.dev/golang.org/x/crypto/nacl/secretbox).
 
 caddycertkeeper is a fork of [techknowlogick/certmagic-s3](https://github.com/techknowlogick/certmagic-s3). **As of November 2026 it is the most actively maintained version of this plugin, with fixes that have not landed anywhere else.**
@@ -241,6 +243,8 @@ make test-race  # with the race detector
 make lint       # golangci-lint v2
 make fmt        # gofumpt
 ```
+
+CI runs the tests with the race detector on the two current Go releases, and the linter, on every push and pull request. There is nothing to build or release: the plugin is compiled into Caddy by `xcaddy`.
 
 ## Credits & thanks
 
