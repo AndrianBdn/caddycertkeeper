@@ -1,144 +1,74 @@
 package caddycertkeeper
 
 import (
-	"bytes"
 	"crypto/rand"
 	"errors"
-	"io"
 
 	"golang.org/x/crypto/nacl/secretbox"
 )
 
 const (
+	// NonceSize is the size of the nonce every encrypted object starts with.
 	NonceSize = 24
+
+	// keySize is the size of an encryption key, in bytes.
+	keySize = 32
 )
 
+// IO turns the data of an object into what is stored for it, and back.
 type IO interface {
-	WrapReader(io.Reader) io.Reader
-	ByteReader([]byte) Reader
+	// Seal returns what is stored for plain.
+	Seal(plain []byte) []byte
+	// Open returns the data that stored was made from, and whether it took
+	// an old key to get it.
+	Open(stored []byte) (plain []byte, underOldKey bool, err error)
 }
 
-type Reader struct {
-	r   io.ReadSeeker
-	l   int64
-	err error
-}
-
-func (r *Reader) Read(buf []byte) (int, error) {
-	if r.err != nil {
-		err := r.err
-		r.err = nil
-		return 0, err
-	}
-	return r.r.Read(buf)
-}
-
-func (r *Reader) Len() int64 {
-	return r.l
-}
-
-func (r *Reader) Seek(offset int64, whence int) (int64, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-	return r.r.Seek(offset, whence)
-}
-
+// CleartextIO stores objects as they are.
 type CleartextIO struct{}
 
-func (ci *CleartextIO) WrapReader(r io.Reader) io.Reader {
-	return r
-}
+func (CleartextIO) Seal(plain []byte) []byte { return plain }
 
-func (ci *CleartextIO) ByteReader(buf []byte) Reader {
-	return Reader{bytes.NewReader(buf), int64(len(buf)), nil}
-}
+func (CleartextIO) Open(stored []byte) ([]byte, bool, error) { return stored, false, nil }
 
+// SecretBoxIO stores an object as a random nonce followed by the object
+// sealed with NaCl secretbox under that nonce.
 type SecretBoxIO struct {
-	// SecretKey encrypts everything written and is tried first when reading.
-	SecretKey [32]byte
-	// OldSecretKeys are tried in order when SecretKey does not decrypt the
-	// data. They are never used to encrypt.
-	OldSecretKeys [][32]byte
+	// keys[0] seals. All of them are tried, in order, to open; the ones
+	// after the first are old keys.
+	keys [][keySize]byte
 }
 
-func NewSecretBoxIO(key [32]byte) *SecretBoxIO {
-	return &SecretBoxIO{SecretKey: key}
+func NewSecretBoxIO(current [keySize]byte, old ...[keySize]byte) *SecretBoxIO {
+	return &SecretBoxIO{keys: append([][keySize]byte{current}, old...)}
 }
 
-func (sb *SecretBoxIO) IsValid() bool {
-	var zero [32]byte
-	return sb.SecretKey != zero
+func (sb *SecretBoxIO) Seal(plain []byte) []byte {
+	var nonce [NonceSize]byte
+	_, _ = rand.Read(nonce[:]) // never fails
+
+	out := make([]byte, NonceSize, NonceSize+len(plain)+secretbox.Overhead)
+	copy(out, nonce[:])
+	return secretbox.Seal(out, plain, &nonce, &sb.keys[0])
 }
 
-func (sb *SecretBoxIO) makeNonce() ([24]byte, error) {
-	var nonce [24]byte
-	_, err := io.ReadFull(rand.Reader, nonce[:])
-	return nonce, err
-}
-
-func (sb *SecretBoxIO) WrapReader(r io.Reader) io.Reader {
-	if !sb.IsValid() {
-		return &Reader{nil, 0, errors.New("SecretBoxIO not properly initialized")}
+func (sb *SecretBoxIO) Open(stored []byte) ([]byte, bool, error) {
+	if len(stored) == 0 {
+		return nil, false, nil
 	}
-
-	allData, err := io.ReadAll(r)
-	if err != nil {
-		return &Reader{nil, 0, err}
-	}
-
-	bout, _, err := sb.open(allData)
-	if err != nil {
-		return &Reader{nil, 0, err}
-	}
-	return bytes.NewReader(bout)
-}
-
-// open decrypts data and reports which key opened it: 0 for SecretKey, n
-// for the nth of OldSecretKeys.
-func (sb *SecretBoxIO) open(data []byte) ([]byte, int, error) {
-	if !sb.IsValid() {
-		return nil, 0, errors.New("SecretBoxIO not properly initialized")
-	}
-	if len(data) == 0 {
-		return nil, 0, nil
-	}
-	if len(data) < NonceSize {
-		return nil, 0, errors.New("insufficient data for decryption: missing nonce")
+	if len(stored) < NonceSize {
+		return nil, false, errors.New("insufficient data for decryption: missing nonce")
 	}
 
 	var nonce [NonceSize]byte
-	copy(nonce[:], data[:NonceSize])
-	encryptedData := data[NonceSize:]
+	copy(nonce[:], stored[:NonceSize])
 
 	// secretbox authenticates the data, so a wrong key fails cleanly and the
 	// next one can be tried.
-	if bout, ok := secretbox.Open(nil, encryptedData, &nonce, &sb.SecretKey); ok {
-		return bout, 0, nil
-	}
-	for i := range sb.OldSecretKeys {
-		if bout, ok := secretbox.Open(nil, encryptedData, &nonce, &sb.OldSecretKeys[i]); ok {
-			return bout, i + 1, nil
+	for i := range sb.keys {
+		if plain, ok := secretbox.Open(nil, stored[NonceSize:], &nonce, &sb.keys[i]); ok {
+			return plain, i > 0, nil
 		}
 	}
-	return nil, 0, errors.New("decryption failed: invalid key or corrupted data")
+	return nil, false, errors.New("decryption failed: invalid key or corrupted data")
 }
-
-func (sb *SecretBoxIO) ByteReader(msg []byte) Reader {
-	if !sb.IsValid() {
-		return Reader{nil, 0, errors.New("SecretBoxIO not properly initialized")}
-	}
-
-	nonce, err := sb.makeNonce()
-	if err != nil {
-		return Reader{nil, 0, err}
-	}
-
-	out := make([]byte, NonceSize, NonceSize+len(msg)+secretbox.Overhead)
-	copy(out, nonce[:])
-
-	out = secretbox.Seal(out, msg, &nonce, &sb.SecretKey)
-	return Reader{bytes.NewReader(out), int64(len(out)), nil}
-}
-
-var _ io.ReadSeeker = (*Reader)(nil)

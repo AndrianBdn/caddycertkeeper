@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 // rawKey is a key no config file could hold: it is not valid UTF-8, has a
@@ -21,6 +20,9 @@ var rawKey = string([]byte{
 	0xff, 0xfe, 0x00, 0x01, 0x80, 0x81, 0xc0, 0xc1, 0xf5, 0xf6, 0x0d, 0x0a, 0x20, 0x09, 0x7f, 0x90,
 	0xa0, 0xb0, 0xd0, 0xe0, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0x0a,
 })
+
+// crKey is a key of raw bytes whose last byte is a carriage return.
+var crKey = rawKey[:keySize-1] + "\r"
 
 func writeKeyFile(t *testing.T, content string) string {
 	t.Helper()
@@ -41,12 +43,8 @@ func TestEncryptionKeyIsUsedAsItsLiteralBytes(t *testing.T) {
 	if err := provisionKeys(t, s); err != nil {
 		t.Fatal(err)
 	}
-	sb, ok := s.iowrap.(*SecretBoxIO)
-	if !ok {
-		t.Fatalf("iowrap is a %T", s.iowrap)
-	}
-	if !bytes.Equal(sb.SecretKey[:], []byte(hexLooking)) {
-		t.Errorf("secretbox key = %x, want the ASCII bytes of the configured key", sb.SecretKey)
+	if keys := boxKeys(t, s); keys[0] != keyOf(hexLooking) {
+		t.Errorf("secretbox key = %x, want the ASCII bytes of the configured key", keys[0])
 	}
 
 	// 32 bytes as 64 hex digits or as base64 are not accepted in place of
@@ -80,6 +78,10 @@ func TestEncryptionKeysFromFiles(t *testing.T) {
 			{"the key and a CRLF", testKeyA + "\r\n", testKeyA},
 			{"raw bytes ending in a newline", rawKey, rawKey},
 			{"raw bytes and a newline", rawKey + "\n", rawKey},
+			{"raw bytes ending in a carriage return, and a newline", crKey + "\n", crKey},
+			{"raw bytes ending in a carriage return, and a CRLF", crKey + "\r\n", crKey},
+			{"a base64: key and a newline", b64(rawKey) + "\n", rawKey},
+			{"a base64: key and a CRLF", b64(rawKey) + "\r\n", rawKey},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -88,7 +90,7 @@ func TestEncryptionKeysFromFiles(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(keys) != 1 || keys[0] != tt.want {
+				if len(keys) != 1 || keys[0] != keyOf(tt.want) {
 					t.Errorf("key = %x, want %x", keys, tt.want)
 				}
 			})
@@ -102,12 +104,7 @@ func TestEncryptionKeysFromFiles(t *testing.T) {
 		if err := provisionKeys(t, s); err != nil {
 			t.Fatal(err)
 		}
-		sb, ok := s.iowrap.(*SecretBoxIO)
-		if !ok {
-			t.Fatalf("iowrap is a %T", s.iowrap)
-		}
-		if string(sb.SecretKey[:]) != rawKey || len(sb.OldSecretKeys) != 2 ||
-			string(sb.OldSecretKeys[0][:]) != testKeyA || string(sb.OldSecretKeys[1][:]) != testKeyB {
+		if !slices.Equal(boxKeys(t, s), keysOf(rawKey, testKeyA, testKeyB)) {
 			t.Error("keys are not in the order of the files")
 		}
 	})
@@ -121,7 +118,7 @@ func TestEncryptionKeysFromFiles(t *testing.T) {
 		}{
 			{"missing file", []string{filepath.Join(t.TempDir(), "nope")}, "nope"},
 			{"missing old file", []string{good, filepath.Join(t.TempDir(), "nope")}, "nope"},
-			{"empty name", []string{""}, "file name 1 is empty"},
+			{"empty name", []string{""}, "encryption_key_file: name 1 is empty"},
 			{"empty file", []string{writeKeyFile(t, "")}, "exactly 32 bytes, got 0"},
 			{"too short", []string{writeKeyFile(t, "short-key-in-a-file\n")}, "exactly 32 bytes, got 19"},
 			{"too long", []string{writeKeyFile(t, testKeyA+testKeyB)}, "exactly 32 bytes, got 64"},
@@ -176,9 +173,8 @@ func TestFileKeysEncryptLikeInlineKeys(t *testing.T) {
 
 	fromFiles := f.instance(srv)
 	fromFiles.EncryptionKeyFile = []string{writeKeyFile(t, testKeyB+"\n"), writeKeyFile(t, testKeyA)}
-	var logged bytes.Buffer
-	fromFiles.Logger = zap.New(zapcore.NewCore(
-		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(&logged), zapcore.DebugLevel))
+	logger, logged := bufferLogger()
+	fromFiles.Logger = logger
 	if err := provisionKeys(t, fromFiles); err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +208,7 @@ func TestFileKeysEncryptLikeInlineKeys(t *testing.T) {
 
 	fromFiles.Logger.Info("storage", zap.Any("storage", fromFiles))
 	assertNoSecrets(t, "log of a file-keyed storage", logged.String())
-	for _, want := range []string{`"key_source":"file"`, `"old_encryption_keys":1`, `"encrypted":true`} {
+	for _, want := range []string{`"key_source":"encryption_key_file"`, `"old_encryption_keys":1`, `"encrypted":true`} {
 		if !strings.Contains(logged.String(), want) {
 			t.Errorf("log lacks %s: %s", want, logged.String())
 		}
@@ -246,12 +242,12 @@ func TestRawKeyFromAFile(t *testing.T) {
 }
 
 func TestCaddyfileEncryptionKeyFile(t *testing.T) {
-	s, err := parseCaddyfile("s3 {\n\tbucket b\n\tencryption_key_file /etc/caddy/cert.key \"/etc/caddy/old cert.key\"\n}")
+	s, err := parseBlock(`encryption_key_file /etc/caddy/cert.key "/etc/caddy/old cert.key"`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"/etc/caddy/cert.key", "/etc/caddy/old cert.key"}
-	if fmt.Sprint(s.EncryptionKeyFile) != fmt.Sprint(want) || s.EncryptionKey != "" || len(s.EncryptionKeySSM) != 0 {
+	if !slices.Equal(s.EncryptionKeyFile, want) || s.EncryptionKey != "" || len(s.EncryptionKeySSM) != 0 {
 		t.Errorf("files = %q, key = %q, ssm = %v", s.EncryptionKeyFile, s.EncryptionKey, s.EncryptionKeySSM)
 	}
 
@@ -263,20 +259,19 @@ func TestCaddyfileEncryptionKeyFile(t *testing.T) {
 	if err := json.Unmarshal(raw, &back); err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(back.EncryptionKeyFile) != fmt.Sprint(want) {
+	if !slices.Equal(back.EncryptionKeyFile, want) {
 		t.Errorf("encryption_key_file lost in the JSON round trip: %s", raw)
 	}
 
-	block := func(lines string) string { return "s3 {\n\tbucket b\n" + lines + "\n}" }
-	for name, input := range map[string]string{
-		"no file":        block("\tencryption_key_file"),
-		"empty name":     block("\tencryption_key_file \"\""),
-		"empty old name": block("\tencryption_key_file /etc/caddy/cert.key \"\""),
-		"file and key":   block("\tencryption_key " + testKeyA + "\n\tencryption_key_file /etc/caddy/cert.key"),
-		"file and ssm":   block("\tencryption_key_ssm /caddy/key\n\tencryption_key_file /etc/caddy/cert.key"),
+	for name, lines := range map[string]string{
+		"no file":        "encryption_key_file",
+		"empty name":     `encryption_key_file ""`,
+		"empty old name": `encryption_key_file /etc/caddy/cert.key ""`,
+		"file and key":   "encryption_key " + testKeyA + "\nencryption_key_file /etc/caddy/cert.key",
+		"file and ssm":   "encryption_key_ssm /caddy/key\nencryption_key_file /etc/caddy/cert.key",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := parseCaddyfile(input); err == nil {
+			if _, err := parseBlock(lines); err == nil {
 				t.Fatal("want an error")
 			} else {
 				assertNoSecrets(t, "error", err.Error())

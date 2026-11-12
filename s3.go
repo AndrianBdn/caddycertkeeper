@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -31,8 +32,12 @@ import (
 
 var ErrInvalidKey = errors.New("invalid key")
 
-// defaultRegion is used when no region is configured anywhere.
-const defaultRegion = "us-east-1"
+const (
+	moduleID = "caddy.storage.s3"
+
+	// defaultRegion is used when no region is configured anywhere.
+	defaultRegion = "us-east-1"
+)
 
 type S3 struct {
 	Logger *zap.Logger
@@ -78,7 +83,7 @@ type S3 struct {
 	iowrap IO
 
 	// ssmClient replaces the SSM client built from the AWS config; tests set it.
-	ssmClient ssmAPI
+	ssmClient *ssm.Client
 
 	locksMu sync.Mutex
 	locks   map[string]*heldLock
@@ -93,6 +98,12 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 
 	if err := s3.checkConfig(); err != nil {
 		return err
+	}
+	if s3.Host != "" {
+		s3.Logger.Info("Using deprecated 'host' option, consider switching to 'endpoint'",
+			zap.String("host", s3.Host),
+			zap.String("endpoint", s3.Endpoint),
+		)
 	}
 
 	cfg, err := s3.loadAWSConfig(ctx)
@@ -109,28 +120,22 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// checkConfig does for every config what the Caddyfile parser does for its
-// own, as far as that cannot move an existing setup: a config written as
-// JSON never passes through the parser. The parser's "acme" prefix and its
-// path-style addressing for custom endpoints are not applied here, because
-// JSON setups that work today depend on not having them.
+// checkConfig applies the rules that hold for every config, whether it was
+// written as a Caddyfile or as JSON. The Caddyfile's defaults are not among
+// them: a JSON config gets no "acme" prefix and no path-style addressing
+// unless it asks for them, as in certmagic-s3.
 func (s3 *S3) checkConfig() error {
 	if s3.Bucket == "" {
 		return errors.New("bucket is required")
 	}
-
-	if s3.Host != "" {
-		// A Caddyfile with 'host' arrives here with the endpoint already
-		// derived from it; a JSON config with 'host' does not.
-		if s3.Endpoint == "" {
-			s3.Endpoint = "https://" + s3.Host
-		}
-		s3.Logger.Info("Using deprecated 'host' option, consider switching to 'endpoint'",
-			zap.String("host", s3.Host),
-			zap.String("endpoint", s3.Endpoint),
-		)
+	if s3.Host != "" && s3.Endpoint == "" {
+		s3.Endpoint = "https://" + s3.Host
 	}
-	return nil
+	if _, err := s3.keySource(); err != nil {
+		return err
+	}
+	_, err := s3.inlineKeys()
+	return err
 }
 
 // loadAWSConfig resolves the region and credentials. The S3 client and, when
@@ -148,7 +153,13 @@ func (s3 *S3) loadAWSConfig(ctx context.Context) (aws.Config, error) {
 
 	if s3.Insecure {
 		s3.Logger.Warn("TLS certificate verification is disabled - this is insecure and should only be used for testing")
-		configOptions = append(configOptions, config.WithHTTPClient(insecureHTTPClient()))
+		// As in certmagic-s3, 'insecure' also covers the calls that fetch
+		// credentials, such as the STS call for role_arn. Not with the keys
+		// in SSM: then it stays on the bucket connection alone, so that the
+		// credentials that can read the keys never cross an unverified one.
+		if len(s3.EncryptionKeySSM) == 0 {
+			configOptions = append(configOptions, config.WithHTTPClient(insecureHTTPClient()))
+		}
 	}
 
 	if s3.AccessKey != "" && s3.SecretKey != "" {
@@ -206,6 +217,12 @@ func (s3 *S3) newS3Client(cfg aws.Config) *s3sdk.Client {
 		})
 	}
 
+	if s3.Insecure {
+		s3Options = append(s3Options, func(o *s3sdk.Options) {
+			o.HTTPClient = insecureHTTPClient()
+		})
+	}
+
 	return s3sdk.NewFromConfig(cfg, s3Options...)
 }
 
@@ -214,7 +231,7 @@ func (s3 *S3) newS3Client(cfg aws.Config) *s3sdk.Client {
 // without this method zap falls back to reflection and writes every field,
 // credentials and encryption keys included.
 func (s3 *S3) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	enc.AddString("module", "caddy.storage.s3")
+	enc.AddString("module", moduleID)
 	enc.AddString("endpoint", s3.Endpoint)
 	enc.AddString("bucket", s3.Bucket)
 	enc.AddString("region", s3.Region)
@@ -226,7 +243,8 @@ func (s3 *S3) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 		enc.AddString("role_arn", s3.RoleARN)
 	}
 	enc.AddBool("static_credentials", s3.AccessKey != "" && s3.SecretKey != "")
-	enc.AddBool("encrypted", s3.keySource() != "")
+	keySource, _ := s3.keySource()
+	enc.AddBool("encrypted", keySource != "")
 	return nil
 }
 
@@ -243,7 +261,7 @@ func (s3 *S3) GoString() string {
 
 func (s3 *S3) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID: "caddy.storage.s3",
+		ID: moduleID,
 		New: func() caddy.Module {
 			return new(S3)
 		},
@@ -271,20 +289,24 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 		)
 	}()
 
-	r := s3.iowrap.ByteReader(value)
-
-	input := &s3sdk.PutObjectInput{
-		Bucket:        aws.String(s3.Bucket),
-		Key:           aws.String(objName),
-		Body:          &r,
-		ContentLength: aws.Int64(r.Len()),
-	}
-
-	_, err := s3.Client.PutObject(ctx, input)
-	if err != nil {
+	if err := s3.putObject(ctx, objName, value, nil); err != nil {
 		return fmt.Errorf("failed to store key %s: %w", key, err)
 	}
 	return nil
+}
+
+// putObject stores value, sealed, as the object objName. With ifMatch, the
+// write only happens if the object still has that ETag.
+func (s3 *S3) putObject(ctx context.Context, objName string, value []byte, ifMatch *string) error {
+	sealed := s3.iowrap.Seal(value)
+	_, err := s3.Client.PutObject(ctx, &s3sdk.PutObjectInput{
+		Bucket:        aws.String(s3.Bucket),
+		Key:           aws.String(objName),
+		Body:          bytes.NewReader(sealed),
+		ContentLength: aws.Int64(int64(len(sealed))),
+		IfMatch:       ifMatch,
+	})
+	return err
 }
 
 func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
@@ -322,7 +344,7 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
 	}
-	buf, underOldKey, err := s3.decrypt(stored)
+	buf, underOldKey, err := s3.iowrap.Open(stored)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
 	}
@@ -330,18 +352,6 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 		s3.reencrypt(ctx, objName, buf, aws.ToString(result.ETag))
 	}
 	return buf, nil
-}
-
-// decrypt opens what was stored, and reports whether it took one of the old
-// encryption keys to do it.
-func (s3 *S3) decrypt(stored []byte) (plain []byte, underOldKey bool, err error) {
-	if sb, ok := s3.iowrap.(*SecretBoxIO); ok {
-		var key int
-		plain, key, err = sb.open(stored)
-		return plain, key > 0, err
-	}
-	plain, err = io.ReadAll(s3.iowrap.WrapReader(bytes.NewReader(stored)))
-	return plain, false, err
 }
 
 // reencrypt stores an object that was just read under an old encryption key
@@ -360,14 +370,7 @@ func (s3 *S3) reencrypt(ctx context.Context, objName string, plain []byte, etag 
 		return
 	}
 
-	r := s3.iowrap.ByteReader(plain)
-	_, err := s3.Client.PutObject(ctx, &s3sdk.PutObjectInput{
-		Bucket:        aws.String(s3.Bucket),
-		Key:           aws.String(objName),
-		Body:          &r,
-		ContentLength: aws.Int64(r.Len()),
-		IfMatch:       aws.String(etag),
-	})
+	err := s3.putObject(ctx, objName, plain, aws.String(etag))
 	switch {
 	case err == nil:
 		s3.Logger.Info("re-encrypted object under the current encryption key", zap.String("key", objName))
@@ -528,7 +531,6 @@ func (s3 *S3) List(ctx context.Context, path string, recursive bool) ([]string, 
 				// consoles create for a "folder": not a key in it.
 				continue
 			}
-			// Strip the configured prefix from the key before appending
 			keys = append(keys, strings.TrimPrefix(name, root))
 		}
 		for _, sub := range result.CommonPrefixes {
@@ -626,8 +628,26 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // setCaddyfileOption reads the value, or values, of the option the
 // dispenser is on.
-func (s3 *S3) setCaddyfileOption(d *caddyfile.Dispenser, key string) error {
-	stringOptions := map[string]*string{
+func (s3 *S3) setCaddyfileOption(d *caddyfile.Dispenser, option string) error {
+	switch option {
+	case "insecure":
+		return boolArg(d, option, &s3.Insecure)
+	case "use_path_style":
+		return boolArg(d, option, &s3.UsePathStyle)
+	case keysInFiles:
+		return listArg(d, &s3.EncryptionKeyFile)
+	case keysInSSM:
+		return listArg(d, &s3.EncryptionKeySSM)
+	case keysInConfig:
+		var keys []string
+		if err := listArg(d, &keys); err != nil {
+			return err
+		}
+		s3.EncryptionKey, s3.OldEncryptionKeys = keys[0], keys[1:]
+		return nil
+	}
+
+	dst, ok := map[string]*string{
 		"host":       &s3.Host,
 		"endpoint":   &s3.Endpoint,
 		"bucket":     &s3.Bucket,
@@ -637,85 +657,51 @@ func (s3 *S3) setCaddyfileOption(d *caddyfile.Dispenser, key string) error {
 		"profile":    &s3.Profile,
 		"role_arn":   &s3.RoleARN,
 		"prefix":     &s3.Prefix,
+	}[option]
+	if !ok {
+		return d.Errf("unknown configuration option: %s", option)
 	}
-	boolOptions := map[string]*bool{
-		"insecure":       &s3.Insecure,
-		"use_path_style": &s3.UsePathStyle,
+	if !d.AllArgs(dst) {
+		return oneValueErr(d, option)
 	}
-
-	if dst, ok := stringOptions[key]; ok {
-		value, err := oneArg(d)
-		if err != nil {
-			return err
-		}
-		*dst = value
-		return nil
-	}
-	if dst, ok := boolOptions[key]; ok {
-		// A bare 'insecure' is refused rather than read as true: until now
-		// it was skipped, and a config must not lose TLS verification by
-		// being moved to this version.
-		value, err := oneArg(d)
-		if err != nil {
-			return err
-		}
-		parsed, err := strconv.ParseBool(value)
-		if err != nil {
-			return d.Errf("invalid boolean value for '%s': %v", key, err)
-		}
-		*dst = parsed
-		return nil
-	}
-
-	return s3.setCaddyfileKeyOption(d, key)
+	return nil
 }
 
-// setCaddyfileKeyOption reads the options that take the current encryption
-// key, or where to find it, followed by any number of old ones.
-func (s3 *S3) setCaddyfileKeyOption(d *caddyfile.Dispenser, key string) error {
-	// encryption_key_file <file> [<old_file>...]
-	// encryption_key_ssm <parameter> [<old_parameter>...]
-	locations := map[string]*[]string{
-		"encryption_key_file": &s3.EncryptionKeyFile,
-		"encryption_key_ssm":  &s3.EncryptionKeySSM,
+// oneValueErr is the error for an option that was given no value or more
+// than one. It names the option only: the values may be a secret, or the
+// two halves of one that needed quoting.
+func oneValueErr(d *caddyfile.Dispenser, option string) error {
+	return d.Errf("%s takes exactly one value", option)
+}
+
+// boolArg reads the value of a flag. A flag without a value is an error,
+// not true: TLS verification must not be switched off by omission.
+func boolArg(d *caddyfile.Dispenser, option string, dst *bool) error {
+	var value string
+	if !d.AllArgs(&value) {
+		return oneValueErr(d, option)
 	}
-	dst, isLocation := locations[key]
-	if !isLocation && key != "encryption_key" {
-		return d.Errf("unknown configuration option: %s", key)
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return d.Errf("invalid boolean value for '%s': %v", option, err)
 	}
+	*dst = parsed
+	return nil
+}
+
+// listArg reads the values of an option that takes one or more: the
+// current key, or where it is, followed by any number of old ones.
+func listArg(d *caddyfile.Dispenser, dst *[]string) error {
 	args := d.RemainingArgs()
 	if len(args) == 0 {
 		return d.ArgErr()
 	}
-
-	if isLocation {
-		for i, name := range args {
-			if name == "" {
-				return d.Errf("%s: name %d is empty", key, i+1)
-			}
-		}
-		*dst = args
-		return nil
-	}
-
-	// encryption_key <key> [<old_key>...]
-	// The keys are checked once the whole block is read.
-	s3.EncryptionKey = args[0]
-	s3.OldEncryptionKeys = append(s3.OldEncryptionKeys, args[1:]...)
+	*dst = args
 	return nil
 }
 
-// oneArg reads the value of an option that takes exactly one.
-func oneArg(d *caddyfile.Dispenser) (string, error) {
-	var value string
-	if !d.Args(&value) || d.NextArg() {
-		return "", d.ArgErr()
-	}
-	return value, nil
-}
-
-// finishCaddyfile applies the defaults and checks the options against each
-// other once the whole block is read.
+// finishCaddyfile applies the Caddyfile's defaults and checks the options
+// against each other once the whole block is read.
 func (s3 *S3) finishCaddyfile(d *caddyfile.Dispenser) error {
 	if s3.Region == "" {
 		s3.Region = defaultRegion
@@ -724,23 +710,15 @@ func (s3 *S3) finishCaddyfile(d *caddyfile.Dispenser) error {
 		s3.Prefix = "acme"
 	}
 
-	if s3.Bucket == "" {
-		return d.Err("bucket is required")
+	if s3.Host != "" && s3.Endpoint != "" {
+		return d.Err("cannot specify both 'host' and 'endpoint' options")
 	}
-	if _, err := s3.inlineKeys(); err != nil {
-		return d.Err(err.Error())
-	}
-
-	if s3.Host != "" {
-		if s3.Endpoint != "" {
-			return d.Err("cannot specify both 'host' and 'endpoint' options")
-		}
-		s3.Endpoint = "https://" + s3.Host
+	if err := s3.checkConfig(); err != nil {
+		return d.WrapErr(err)
 	}
 	if s3.Endpoint != "" {
 		s3.UsePathStyle = true
 	}
-
 	return nil
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -91,7 +92,7 @@ func TestEncryptionKeysFromSSM(t *testing.T) {
 	}}
 	client := fake.client()
 
-	keysFor := func(params ...string) ([]string, error) {
+	keysFor := func(params ...string) ([][keySize]byte, error) {
 		s := &S3{Logger: zap.NewNop(), EncryptionKeySSM: params, ssmClient: client}
 		return s.encryptionKeys(context.Background(), aws.Config{})
 	}
@@ -101,8 +102,8 @@ func TestEncryptionKeysFromSSM(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if fmt.Sprint(keys) != fmt.Sprint([]string{testKeyB, testKeyA, testKeyC}) {
-			t.Errorf("keys = %q", keys)
+		if !slices.Equal(keys, keysOf(testKeyB, testKeyA, testKeyC)) {
+			t.Errorf("keys = %x", keys)
 		}
 	})
 
@@ -115,7 +116,7 @@ func TestEncryptionKeysFromSSM(t *testing.T) {
 		}
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
-		if fmt.Sprint(fake.regions) != fmt.Sprint([]string{"us-east-1", "eu-west-1"}) {
+		if !slices.Equal(fake.regions, []string{"us-east-1", "eu-west-1"}) {
 			t.Errorf("request regions = %v", fake.regions)
 		}
 	})
@@ -152,15 +153,8 @@ func TestSSMKeysEncryptLikeInlineKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oldInline := f.instance(srv)
-	oldInline.EncryptionKey = testKeyA
-	newInline := f.instance(srv)
-	newInline.EncryptionKey = testKeyB
-	for _, s := range []*S3{oldInline, newInline} {
-		if err := provisionKeys(t, s); err != nil {
-			t.Fatal(err)
-		}
-	}
+	instance := encryptedInstances(t, f, srv)
+	oldInline, newInline := instance(testKeyA), instance(testKeyB)
 
 	if err := oldInline.Store(ctx, "before", []byte("under the old key")); err != nil {
 		t.Fatal(err)

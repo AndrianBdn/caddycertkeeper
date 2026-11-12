@@ -49,9 +49,13 @@ type fakeObject struct {
 	modified time.Time
 }
 
+func newFakeBucket(t *testing.T) *fakeS3 {
+	return &fakeS3{t: t, objects: make(map[string]*fakeObject), pageSize: 1000}
+}
+
 func newFakeS3(t *testing.T) (*fakeS3, *httptest.Server) {
 	t.Helper()
-	f := &fakeS3{t: t, objects: make(map[string]*fakeObject), pageSize: 1000}
+	f := newFakeBucket(t)
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	return f, srv

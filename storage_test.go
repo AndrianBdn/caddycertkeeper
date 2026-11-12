@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io/fs"
 	"math/big"
-	"sort"
+	"slices"
 	"testing"
 	"time"
 
@@ -74,10 +74,23 @@ func newStorePair(t *testing.T) (*S3, *certmagic.FileStorage, *fakeS3) {
 	return s, ref, f
 }
 
-func sorted(keys []string) []string {
-	out := append([]string{}, keys...)
-	sort.Strings(out)
-	return out
+// terminalKeys returns the keys under path in the reference storage that
+// are not directories. Listed recursively, the file storage also returns
+// the directories it walks through.
+func terminalKeys(t *testing.T, ref *certmagic.FileStorage, path string) []string {
+	t.Helper()
+	ctx := context.Background()
+	all, err := ref.List(ctx, path, true)
+	if err != nil {
+		t.Fatalf("file storage: %v", err)
+	}
+	var keys []string
+	for _, key := range all {
+		if info, statErr := ref.Stat(ctx, key); statErr == nil && info.IsTerminal {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 var listedPaths = []string{
@@ -109,7 +122,7 @@ func TestListNonRecursiveMatchesFileStorage(t *testing.T) {
 				if err != nil {
 					t.Fatalf("List: %v", err)
 				}
-				if fmt.Sprint(sorted(got)) != fmt.Sprint(sorted(want)) {
+				if !slices.Equal(sorted(got), sorted(want)) {
 					t.Errorf("List(%q, false)\n got %q\nwant %q", p, sorted(got), sorted(want))
 				}
 			})
@@ -117,8 +130,6 @@ func TestListNonRecursiveMatchesFileStorage(t *testing.T) {
 	}
 }
 
-// Recursively, the file storage also returns the directories it walks
-// through; only the terminal keys are compared.
 func TestListRecursiveMatchesFileStorage(t *testing.T) {
 	s, ref, f := newStorePair(t)
 	ctx := context.Background()
@@ -126,21 +137,12 @@ func TestListRecursiveMatchesFileStorage(t *testing.T) {
 
 	for _, p := range listedPaths {
 		t.Run(fmt.Sprintf("%q", p), func(t *testing.T) {
-			all, err := ref.List(ctx, p, true)
-			if err != nil {
-				t.Fatalf("file storage: %v", err)
-			}
-			var want []string
-			for _, key := range all {
-				if info, statErr := ref.Stat(ctx, key); statErr == nil && info.IsTerminal {
-					want = append(want, key)
-				}
-			}
+			want := terminalKeys(t, ref, p)
 			got, err := s.List(ctx, p, true)
 			if err != nil {
 				t.Fatalf("List: %v", err)
 			}
-			if fmt.Sprint(sorted(got)) != fmt.Sprint(sorted(want)) {
+			if !slices.Equal(sorted(got), sorted(want)) {
 				t.Errorf("List(%q, true)\n got %q\nwant %q", p, sorted(got), sorted(want))
 			}
 		})
@@ -209,21 +211,12 @@ func TestDeleteMatchesFileStorage(t *testing.T) {
 		}
 	}
 
-	var want []string
-	all, err := ref.List(ctx, "", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, key := range all {
-		if info, statErr := ref.Stat(ctx, key); statErr == nil && info.IsTerminal {
-			want = append(want, key)
-		}
-	}
+	want := terminalKeys(t, ref, "")
 	got, err := s.List(ctx, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(sorted(got)) != fmt.Sprint(sorted(want)) {
+	if !slices.Equal(sorted(got), sorted(want)) {
 		t.Errorf("keys left after the deletes\n got %q\nwant %q", sorted(got), sorted(want))
 	}
 	if len(got) != len(storeKeys)-1-3-6 {
@@ -323,7 +316,7 @@ func TestCertmagicCleanStorageRemovesExpiredCerts(t *testing.T) {
 		issuer + "valid.example.com/valid.example.com.json",
 		issuer + "valid.example.com/valid.example.com.key",
 	}
-	if fmt.Sprint(sorted(left)) != fmt.Sprint(want) {
+	if !slices.Equal(sorted(left), want) {
 		t.Errorf("certificates left after the clean\n got %q\nwant %q", sorted(left), want)
 	}
 }

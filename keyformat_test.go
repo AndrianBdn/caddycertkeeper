@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"slices"
 	"strings"
 	"testing"
 
@@ -38,7 +39,7 @@ func TestParseKey(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got != tt.want {
+				if got != keyOf(tt.want) {
 					t.Errorf("key = %x, want %x", got, tt.want)
 				}
 			})
@@ -57,6 +58,8 @@ func TestParseKey(t *testing.T) {
 			"base64 of 16 bytes":          {"base64:" + base64.StdEncoding.EncodeToString(make([]byte, 16)), "base64 of exactly 32 bytes, got 16"},
 			"base64 of 33 bytes":          {"base64:" + base64.StdEncoding.EncodeToString(make([]byte, 33)), "base64 of exactly 32 bytes, got 33"},
 			"not base64":                  {"base64:" + strings.Repeat("!", 44), "not valid base64"},
+			"base64 of 32 zero bytes":     {"base64:" + base64.StdEncoding.EncodeToString(make([]byte, 32)), "all zero"},
+			"32 zero bytes":               {string(make([]byte, 32)), "all zero"},
 			"a space inside":              {"base64:" + std[:20] + " " + std[20:], "not valid base64"},
 			"a line break inside":         {"base64:" + std[:20] + "\n" + std[20:], "not valid base64"},
 			"a character cut off the end": {"base64:" + strings.TrimRight(std, "=")[:42], "not valid base64"},
@@ -64,7 +67,7 @@ func TestParseKey(t *testing.T) {
 			t.Run(name, func(t *testing.T) {
 				got, err := parseKey(tt.value)
 				assertError(t, err, tt.wantErr, "parsing the key")
-				if got != "" {
+				if got != [keySize]byte{} {
 					t.Errorf("a key came back with the error: %x", got)
 				}
 				// The error describes the value without repeating it.
@@ -84,13 +87,8 @@ func TestBase64KeysFromEverySource(t *testing.T) {
 		if err := provisionKeys(t, s); err != nil {
 			t.Fatal(err)
 		}
-		sb, ok := s.iowrap.(*SecretBoxIO)
-		if !ok {
-			t.Fatalf("iowrap is a %T", s.iowrap)
-		}
-		if string(sb.SecretKey[:]) != plusSlashKey || len(sb.OldSecretKeys) != 2 ||
-			string(sb.OldSecretKeys[0][:]) != testKeyA || string(sb.OldSecretKeys[1][:]) != rawKey {
-			t.Errorf("keys = %x, %x", sb.SecretKey, sb.OldSecretKeys)
+		if keys := boxKeys(t, s); !slices.Equal(keys, keysOf(plusSlashKey, testKeyA, rawKey)) {
+			t.Errorf("keys = %x", keys)
 		}
 	}
 
@@ -99,7 +97,7 @@ func TestBase64KeysFromEverySource(t *testing.T) {
 	})
 
 	t.Run("Caddyfile, unquoted", func(t *testing.T) {
-		s, err := parseCaddyfile("s3 {\n\tbucket b\n\tencryption_key " + b64(plusSlashKey) + " " + testKeyA + " " + b64(rawKey) + "\n}")
+		s, err := parseBlock("encryption_key " + b64(plusSlashKey) + " " + testKeyA + " " + b64(rawKey))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -152,7 +150,7 @@ func TestBadBase64KeysAreRejectedEverywhere(t *testing.T) {
 		})
 	}
 
-	if _, err := parseCaddyfile("s3 {\n\tbucket b\n\tencryption_key " + bad + "\n}"); err == nil {
+	if _, err := parseBlock("encryption_key " + bad); err == nil {
 		t.Error("Caddyfile with a bad base64 key was accepted")
 	}
 }

@@ -5,17 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"maps"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 const (
@@ -52,12 +51,7 @@ func assertNoSecrets(t *testing.T, what, out string) {
 // certmagic logs its storage with zap.Any("storage", storage) on every
 // storage clean. That line must not carry credentials or encryption keys.
 func TestLoggingTheStorageOmitsSecrets(t *testing.T) {
-	var buf bytes.Buffer
-	logger := zap.New(zapcore.NewCore(
-		zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()),
-		zapcore.AddSync(&buf),
-		zapcore.DebugLevel,
-	))
+	logger, buf := bufferLogger()
 
 	// As certmagic holds it: behind the certmagic.Storage interface.
 	var storage certmagic.Storage = storageWithSecrets()
@@ -81,7 +75,7 @@ func TestLoggingTheStorageOmitsSecrets(t *testing.T) {
 		"static_credentials": true,
 		"encrypted":          true,
 	}
-	if fmt.Sprint(line.Storage) != fmt.Sprint(want) {
+	if !maps.Equal(line.Storage, want) {
 		t.Errorf("logged storage = %v, want %v", line.Storage, want)
 	}
 }
@@ -111,7 +105,7 @@ func TestJSONConfigKeepsSecrets(t *testing.T) {
 	if back.AccessKey != testAccessKey || back.SecretKey != testSecretKey || back.EncryptionKey != testKeyA {
 		t.Errorf("secrets lost in the JSON round trip: %s", raw)
 	}
-	if fmt.Sprint(back.OldEncryptionKeys) != fmt.Sprint([]string{testKeyB, testKeyC}) {
+	if !slices.Equal(back.OldEncryptionKeys, []string{testKeyB, testKeyC}) {
 		t.Errorf("old_encryption_keys = %v", back.OldEncryptionKeys)
 	}
 }
@@ -254,11 +248,7 @@ func TestLoadDoesNotReencryptOverAConcurrentWrite(t *testing.T) {
 			}
 
 			// What the other instance stores, sealed as it would seal it.
-			renewed := newOnly.iowrap.ByteReader([]byte("the renewed certificate"))
-			renewedBody, err := io.ReadAll(&renewed)
-			if err != nil {
-				t.Fatal(err)
-			}
+			renewedBody := newOnly.iowrap.Seal([]byte("the renewed certificate"))
 			f.afterGet = func(key string) {
 				f.afterGet = nil
 				if change == "deleted" {
@@ -312,28 +302,32 @@ func TestLoadWithoutOldKeysDoesNotWrite(t *testing.T) {
 	}
 }
 
-func TestSecretBoxIO_OldKeys(t *testing.T) {
-	keyOf := func(s string) (k [32]byte) { copy(k[:], s); return k }
-
-	seal := func(key string, msg string) []byte {
-		r := (&SecretBoxIO{SecretKey: keyOf(key)}).ByteReader([]byte(msg))
-		out, err := io.ReadAll(&r)
-		if err != nil {
-			t.Fatalf("encrypting: %v", err)
-		}
-		return out
+// A line with the wrong number of values is refused without repeating any
+// of them: they may be a secret, or the halves of one that needed quoting.
+func TestCaddyfileErrorsDoNotRepeatValues(t *testing.T) {
+	for name, lines := range map[string]string{
+		"extra value after the secret key":  "secret_key " + testSecretKey + " extra-value",
+		"secret key split in two":           "secret_key first-half-of-it second-half-of-it",
+		"extra value after the access key":  "access_key " + testAccessKey + " extra-value",
+		"extra value after another option":  "region first-half-of-it second-half-of-it",
+		"extra value after a flag":          "insecure first-half-of-it second-half-of-it",
+		"encryption key that is too long":   "encryption_key " + testKeyA + "first-half-of-it",
+		"old encryption key that is short":  "encryption_key " + testKeyA + " second-half-of-it",
+		"encryption key file, then nothing": "encryption_key_file",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseBlock(lines)
+			if err == nil {
+				t.Fatal("want an error")
+			}
+			assertNoSecrets(t, "error", err.Error())
+			for _, value := range []string{"extra-value", "first-half-of-it", "second-half-of-it"} {
+				if strings.Contains(err.Error(), value) {
+					t.Errorf("error repeats a value from the line: %v", err)
+				}
+			}
+		})
 	}
-
-	sb := &SecretBoxIO{SecretKey: keyOf(testKeyA), OldSecretKeys: [][32]byte{keyOf(testKeyB), keyOf(testKeyC)}}
-	for _, key := range []string{testKeyA, testKeyB, testKeyC} {
-		got, err := io.ReadAll(sb.WrapReader(bytes.NewReader(seal(key, "hello"))))
-		if err != nil || string(got) != "hello" {
-			t.Errorf("data sealed with key %c: got %q, %v", key[0], got, err)
-		}
-	}
-
-	_, err := io.ReadAll(sb.WrapReader(bytes.NewReader(seal("DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD", "hello"))))
-	assertError(t, err, "decryption failed", "decrypting with no matching key")
 }
 
 func TestBadKeyConfigIsRejected(t *testing.T) {
@@ -368,13 +362,8 @@ func TestBadKeyConfigIsRejected(t *testing.T) {
 }
 
 func TestCaddyfileEncryptionKeys(t *testing.T) {
-	parse := func(body string) (*S3, error) {
-		s := new(S3)
-		return s, s.UnmarshalCaddyfile(caddyfile.NewTestDispenser("s3 {\n\tbucket my-certificates\n" + body + "\n}"))
-	}
-
 	t.Run("single key", func(t *testing.T) {
-		s, err := parse("\tencryption_key " + testKeyA)
+		s, err := parseBlock("\tencryption_key " + testKeyA)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -384,17 +373,17 @@ func TestCaddyfileEncryptionKeys(t *testing.T) {
 	})
 
 	t.Run("key followed by old keys", func(t *testing.T) {
-		s, err := parse("\tencryption_key " + testKeyA + " " + testKeyB + " \"" + testKeyC + "\"")
+		s, err := parseBlock("\tencryption_key " + testKeyA + " " + testKeyB + " \"" + testKeyC + "\"")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if s.EncryptionKey != testKeyA || fmt.Sprint(s.OldEncryptionKeys) != fmt.Sprint([]string{testKeyB, testKeyC}) {
+		if s.EncryptionKey != testKeyA || !slices.Equal(s.OldEncryptionKeys, []string{testKeyB, testKeyC}) {
 			t.Errorf("key = %q, old = %v", s.EncryptionKey, s.OldEncryptionKeys)
 		}
 	})
 
 	t.Run("no key", func(t *testing.T) {
-		s, err := parse("")
+		s, err := parseBlock("")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -404,12 +393,12 @@ func TestCaddyfileEncryptionKeys(t *testing.T) {
 	})
 
 	t.Run("keys in SSM", func(t *testing.T) {
-		s, err := parse("\tencryption_key_ssm /caddy/key-new arn:aws:ssm:eu-west-1:123456789012:parameter/caddy/key")
+		s, err := parseBlock("\tencryption_key_ssm /caddy/key-new arn:aws:ssm:eu-west-1:123456789012:parameter/caddy/key")
 		if err != nil {
 			t.Fatal(err)
 		}
 		want := []string{"/caddy/key-new", "arn:aws:ssm:eu-west-1:123456789012:parameter/caddy/key"}
-		if s.EncryptionKey != "" || fmt.Sprint(s.EncryptionKeySSM) != fmt.Sprint(want) {
+		if s.EncryptionKey != "" || !slices.Equal(s.EncryptionKeySSM, want) {
 			t.Errorf("key = %q, ssm = %v", s.EncryptionKey, s.EncryptionKeySSM)
 		}
 	})
@@ -422,7 +411,7 @@ func TestCaddyfileEncryptionKeys(t *testing.T) {
 		"second key is too long": "\tencryption_key " + testKeyA + " " + testKeyB + "B",
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := parse(body)
+			_, err := parseBlock(body)
 			if err == nil {
 				t.Fatal("want an error")
 			}

@@ -2,99 +2,70 @@
 
 [![CI](https://github.com/AndrianBdn/caddycertkeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrianBdn/caddycertkeeper/actions/workflows/ci.yml)
 
-S3 storage for [Caddy](https://caddyserver.com) and [CertMagic](https://github.com/caddyserver/certmagic): keep certificates, private keys and ACME accounts in any S3-compatible bucket, share them between instances, and optionally encrypt them on the client with [secretbox](https://pkg.go.dev/golang.org/x/crypto/nacl/secretbox).
+S3 storage for [Caddy](https://caddyserver.com) and [CertMagic](https://github.com/caddyserver/certmagic). It keeps certificates, private keys and ACME accounts in an S3-compatible bucket, shares them between Caddy instances, and can encrypt them before they leave Caddy.
 
-caddycertkeeper is a fork of [techknowlogick/certmagic-s3](https://github.com/techknowlogick/certmagic-s3). **As of November 2026 it is the most actively maintained version of this plugin, with fixes that have not landed anywhere else.**
+caddycertkeeper is a fork of [techknowlogick/certmagic-s3](https://github.com/techknowlogick/certmagic-s3) and a **drop-in replacement** for it: the same plugin, just better maintained. **As of November 2026 it is the most actively maintained version of this plugin, with fixes that have not landed anywhere else.**
 
-## Drop-in replacement for certmagic-s3
+```sh
+xcaddy build --with github.com/AndrianBdn/caddycertkeeper
+```
 
-caddycertkeeper is a drop-in replacement for `techknowlogick/certmagic-s3`. It is the same plugin, just better maintained:
+## Switching from certmagic-s3
 
-- the Caddy module is still `caddy.storage.s3`, so `storage s3 { ... }` in a Caddyfile and `"module": "s3"` in JSON keep working;
-- every existing option keeps its name and meaning;
-- the bucket layout, the lock objects and the encryption format are unchanged, so it reads what certmagic-s3 wrote, and the other way round. (The other way round holds for as long as you keep a key certmagic-s3 can be given: it does not know the `base64:` keys [recommended below](#generating-a-key).)
-
-Switching is a change to the build, not to the config or the bucket:
+Change the build, not the config or the bucket:
 
 ```diff
 - xcaddy build --with github.com/techknowlogick/certmagic-s3
 + xcaddy build --with github.com/AndrianBdn/caddycertkeeper
 ```
 
-Build only one of the two into a Caddy binary: both register `caddy.storage.s3`.
+- The Caddy module is still `caddy.storage.s3`, so existing Caddyfiles and JSON configs keep working. Build only one of the two plugins into a Caddy binary.
+- Every option keeps its name and meaning.
+- The bucket layout, the locks and the encryption format are unchanged, so each plugin reads what the other wrote. The exception is the new `base64:` [key format](#generating-a-key), which certmagic-s3 does not know.
 
-Two things behave differently after the switch, both because folder listings now work:
+What you will notice after the switch:
 
-- The first storage clean removes certificates that expired more than two weeks ago (Caddy's grace period), together with their private keys and metadata.
-- If no ACME account email is configured and the bucket holds more than one account for a CA, CertMagic now picks the most recently used one, as it does on disk. Before, it could not see the accounts and used the default one.
+- **Expired certificates get deleted.** The first storage clean removes certificates that expired more than two weeks ago, with their private keys. certmagic-s3 never removed them.
+- **A different ACME account may be picked.** With no account email configured and several accounts in the bucket, CertMagic now uses the most recently used one, as it does on disk.
+- **Config mistakes are errors.** A Caddyfile option with no value, with too many values, or an unknown word on its own line fails with the line number. A bare `insecure` used to do nothing; write `insecure true`. A JSON config without `bucket` fails too.
+- **`host` works in JSON.** A JSON config with `host` and no `endpoint` now talks to that host. Before, `host` was ignored there and requests went to AWS.
 
-And a config with a mistake in it, which certmagic-s3 loaded while skipping the mistake, is now refused with an error that names the line:
-
-- In a Caddyfile: an option with no value (`insecure` on a line of its own did nothing; write `insecure true`), an option with more values than it takes, or an unknown word on a line of its own.
-- In JSON: a config without `bucket`. A JSON config with `host` and no `endpoint` now talks to that host; before, `host` was ignored there and requests went to AWS.
-
-## What is fixed and added here
+## What is fixed and added
 
 Compared to certmagic-s3 v1.5.0:
 
-- **Secrets are no longer written to the log.** CertMagic logs its storage on startup and on every periodic storage clean (`"msg":"cleaning storage unit"`). With certmagic-s3 that line carries the whole config: `access_key`, `secret_key` and `encryption_key` in plain text ([certmagic-s3#28](https://github.com/techknowlogick/certmagic-s3/issues/28)). caddycertkeeper logs the endpoint, bucket, region and prefix, and nothing secret.
-- **Expired certificates are cleaned up, and ECH configs survive a reload.** Caddy and CertMagic walk the storage folder by folder, and certmagic-s3 answered every such listing with all the files below, at any depth. As a result expired certificates and their private keys were never removed from the bucket, and with Encrypted ClientHello enabled every reload discarded the stored ECH configs and generated new ones ([certmagic-s3#26](https://github.com/techknowlogick/certmagic-s3/pull/26)). Listing, `Stat`, `Exists` and `Delete` now treat a key that other keys lie under as a folder, the way CertMagic's own file storage does; the tests compare the two directly.
-- **Encryption key rotation.** `encryption_key` takes the current key followed by any number of old ones, and objects still under an old key are re-encrypted as they are read. Changing the key no longer means emptying the bucket and reissuing every certificate. See [Rotating the encryption key](#rotating-the-encryption-key).
-- **Encryption keys of 32 random bytes.** certmagic-s3 uses the 32 characters of `encryption_key` as the key, as they are, so a key can only be as random as 32 characters of text. A key can now be written as `base64:` followed by the base64 of 32 random bytes; 32-character keys keep working unchanged. See [Generating a key](#generating-a-key).
-- **Encryption keys from AWS SSM Parameter Store.** `encryption_key_ssm` reads the keys from SecureString parameters, so the key is in neither the Caddyfile nor Caddy's JSON config. See [Keeping the key in SSM Parameter Store](#keeping-the-key-in-ssm-parameter-store).
-- **Encryption keys from files.** `encryption_key_file` reads the keys from files, such as a mounted Docker or Kubernetes secret. See [Keeping the key in a file](#keeping-the-key-in-a-file).
-- **Config mistakes are reported, not skipped.** A Caddyfile option without a value was silently dropped, so a bare `insecure` or a line cut short changed nothing and said nothing. JSON configs skipped the checks altogether: `host` was ignored and a missing `bucket` only surfaced as failing requests.
-- **`insecure` only turns off certificate verification.** It used to replace the whole HTTP transport with a bare one, which dropped the proxy settings from the environment and every timeout, so idle connections could stay open after each config reload.
-- Dependencies are current (Caddy v2.11.9), the lint configuration is valid for golangci-lint v2 again, and the Dockerfile uses a Caddy builder image new enough for the Go version the module needs.
+- **Secrets stay out of the log.** CertMagic logs its storage on every storage clean. With certmagic-s3 that line contains `access_key`, `secret_key` and `encryption_key` in plain text ([certmagic-s3#28](https://github.com/techknowlogick/certmagic-s3/issues/28)).
+- **Folder listings work.** certmagic-s3 answered every folder listing with all the files below it, so expired certificates were never cleaned up and ECH configs were regenerated on every reload ([certmagic-s3#26](https://github.com/techknowlogick/certmagic-s3/pull/26)). Listing, `Stat`, `Exists` and `Delete` now behave like CertMagic's own file storage.
+- **Key rotation.** `encryption_key` takes the current key followed by old ones, and objects are re-encrypted as they are read. See [Rotating the key](#rotating-the-key).
+- **Stronger keys.** A key can be 32 random bytes written as `base64:...`, not only 32 characters of text. See [Generating a key](#generating-a-key).
+- **Keys from a file or from AWS SSM Parameter Store**, so the key is not in the config. See [Key in a file](#key-in-a-file) and [Key in SSM Parameter Store](#key-in-ssm-parameter-store).
+- **Config mistakes are reported**, not silently skipped.
+- **`insecure` only turns off certificate verification.** It no longer drops the proxy settings and timeouts of the HTTP client.
+- Current dependencies (Caddy v2.11.9), a working lint config, and CI.
 
-## Building
+## Configuration
 
-```sh
-xcaddy build --with github.com/AndrianBdn/caddycertkeeper
-```
+Only `bucket` is required.
 
-## Configuration options
-
-- `bucket`: S3 bucket name (required)
-- `region`: AWS region (optional, defaults to `us-east-1`)
-- `prefix`: object key prefix (optional, defaults to `acme`)
-- `endpoint`: custom endpoint URL, for S3-compatible providers (optional)
-- `host`: **deprecated**, use `endpoint` instead. Giving both is an error.
-- `use_path_style`: force path-style URLs (optional, always `true` when a custom endpoint is used)
-- `insecure`: skip TLS certificate verification (optional, defaults to `false`)
-- `access_key`, `secret_key`: static credentials (optional)
-- `profile`: AWS shared config profile (optional)
-- `role_arn`: IAM role to assume (optional)
-- `encryption_key`: key for client-side encryption, optionally followed by old keys (optional; without a key, objects are stored in plain text). Written as `base64:` and the base64 of 32 random bytes, see [Generating a key](#generating-a-key); a 32-character key as certmagic-s3 takes it works too.
-- `encryption_key_file`: paths of files holding the encryption keys, instead of `encryption_key` (optional)
-- `encryption_key_ssm`: names or ARNs of SSM parameters holding the encryption keys, instead of `encryption_key` (optional)
+| Option | Meaning |
+| --- | --- |
+| `bucket` | Bucket name. |
+| `region` | AWS region. Defaults to `us-east-1`. |
+| `prefix` | Prefix of every object key. Defaults to `acme`. |
+| `endpoint` | Endpoint URL of an S3-compatible provider. Turns on `use_path_style`. |
+| `use_path_style` | `true` for path-style URLs. |
+| `insecure` | `true` to skip TLS certificate verification. |
+| `access_key`, `secret_key` | Static credentials. |
+| `profile` | AWS shared config profile. |
+| `role_arn` | IAM role to assume. |
+| `encryption_key` | Encryption key, optionally followed by old keys. See [Encryption](#encryption). |
+| `encryption_key_file` | Files holding the encryption keys. |
+| `encryption_key_ssm` | SSM parameters holding the encryption keys. |
+| `host` | Deprecated, use `endpoint`. Giving both is an error. |
 
 Without `access_key`/`secret_key` or `profile`, the AWS SDK's default credential chain is used: environment variables, shared config, and the ECS task or EC2 instance role.
 
-In JSON config the options have the same names; old keys go in `old_encryption_keys` (a list), and `encryption_key_file` and `encryption_key_ssm` are lists. Three defaults are different there, and stay as they are in certmagic-s3 so that existing JSON setups keep finding their objects:
-
-- an empty `prefix` means the root of the bucket, not `acme`;
-- `use_path_style` is not switched on by a custom endpoint, set it yourself if the provider needs it;
-- an empty `region` is taken from the environment or the shared AWS config, and is `us-east-1` only when nothing names one.
-
-## Configuration examples
-
-### AWS S3 with static credentials
-
-```caddyfile
-{
-  storage s3 {
-    bucket "my-certificates"
-    region "us-west-2"
-    access_key "AKIAEXAMPLE"
-    secret_key "EXAMPLE"
-    prefix "caddy-certs"
-    encryption_key "base64:<output of openssl rand -base64 32>"
-  }
-}
-```
-
-### AWS S3 with an instance role and the key in SSM
+Without an encryption key option, objects are stored in plain text.
 
 ```caddyfile
 {
@@ -107,24 +78,35 @@ In JSON config the options have the same names; old keys go in `old_encryption_k
 }
 ```
 
-### S3-compatible provider
+An S3-compatible provider with static credentials:
 
 ```caddyfile
 {
   storage s3 {
     endpoint "https://minio.example.com"
     bucket "my-certificates"
-    region "us-east-1"
     access_key "minioadmin"
     secret_key "minioadmin"
-    prefix "caddy-certs"
+    encryption_key "base64:<output of openssl rand -base64 32>"
   }
 }
 ```
 
+### JSON config
+
+The options have the same names. Old keys go in `old_encryption_keys`, and `encryption_key_file` and `encryption_key_ssm` are lists.
+
+Three defaults differ from the Caddyfile. They are the same as in certmagic-s3, so that existing JSON setups keep finding their objects:
+
+- An empty `prefix` means the root of the bucket, not `acme`.
+- A custom endpoint does not turn on `use_path_style`. Set it yourself if the provider needs it.
+- An empty `region` is taken from the environment or the shared AWS config, and is `us-east-1` only when nothing names one.
+
 ## Encryption
 
-With an encryption key, every object is sealed with NaCl secretbox (XSalsa20-Poly1305) before it leaves Caddy, under a fresh random nonce. The key is exactly 32 bytes, and comes from one of three places: the config (`encryption_key`), files (`encryption_key_file`) or SSM Parameter Store (`encryption_key_ssm`).
+With a key, every object is sealed with NaCl secretbox (XSalsa20-Poly1305) under a fresh random nonce before it leaves Caddy.
+
+The key comes from one of `encryption_key`, `encryption_key_file` or `encryption_key_ssm`; they cannot be combined. Each takes the current key first, optionally followed by old keys. Keys are read when Caddy starts or reloads its config.
 
 ### Generating a key
 
@@ -134,106 +116,84 @@ Generate the key, do not invent it:
 echo "base64:$(openssl rand -base64 32)"
 ```
 
-The output is the value for `encryption_key`, for an SSM parameter, or for a key file:
+The output is a key of 32 random bytes. Use it as the value of `encryption_key`, as the content of a key file, or as the value of an SSM parameter. Both base64 alphabets are accepted, with or without padding, and the value needs no quoting in a Caddyfile.
 
-```caddyfile
-encryption_key "base64:<the 44 characters from openssl>"
-```
+### 32-character keys from certmagic-s3
 
-`base64:` is followed by the base64 of exactly 32 bytes. Both base64 alphabets are read (`+/` and `-_`), with or without the `=` padding, and none of these characters needs quoting in a Caddyfile.
+A certmagic-s3 key is exactly 32 characters, and those characters are the key as they are. They are not decoded from hex or base64, and not stretched from a passphrase. Such keys keep working here, but a key is only as strong as it is random:
 
-### 32-character keys
-
-certmagic-s3 takes a key of exactly 32 bytes of text, and those 32 bytes are the key, as they are. Nothing decodes them from hex or base64: `0123456789abcdef0123456789abcdef` is a key of 32 ASCII characters, not of 16 bytes. Such keys keep working here, unchanged, and a value of exactly 32 bytes is always read this way, whatever it starts with.
-
-In neither form is the key stretched: there is no password hashing between what you configure and the cipher, so a key is only as strong as it is random. That is where the two forms differ:
-
-| How the key is made | Randomness |
+| How the key was made | Randomness |
 | --- | --- |
-| `base64:` and `openssl rand -base64 32` | 256 bits |
+| `base64:` with `openssl rand -base64 32` | 256 bits |
 | 32 characters from `openssl rand -base64 24` | 192 bits |
 | 32 characters from `openssl rand -hex 16` | 128 bits |
 | 32 characters someone made up | far too little |
 
-The generated ones are all far beyond guessing. A made-up phrase is not: anyone who obtains the bucket's contents can try phrases offline, as fast as their hardware allows. If your key is one of those, [rotate](#rotating-the-encryption-key) to a generated one.
+The generated ones are all beyond guessing. A made-up phrase is not: anyone who obtains the bucket's contents can try phrases offline. If your key is one of those, rotate to a generated one.
 
-A 32-character key rewritten as `base64:` and the base64 of those characters is the same key, no stronger than before. `base64:` keys are not understood by certmagic-s3, so once objects are under one, the bucket can only be read with caddycertkeeper.
+certmagic-s3 cannot read `base64:` keys. Once objects are under one, only caddycertkeeper can read the bucket.
 
-### Rotating the encryption key
+### Rotating the key
 
-`encryption_key` accepts a list: the first key encrypts everything that is written, and every key in the list is tried when reading.
+Put the new key first and keep the old one after it:
 
 ```caddyfile
-encryption_key "base64:<new key>" "the-old-32-character-key-as-is!!"
+encryption_key "base64:<new key>" "<old key>"
 ```
 
-For a single instance, or instances that each have their own bucket or prefix, that is the whole rotation: put the new key first, keep the old one after it, reload.
-
-Instances that share a bucket need two steps, because an instance that only knows the old key cannot read what another one wrote under the new key:
-
-1. Roll out `encryption_key <old> <new>` to every instance. All of them can now read both keys and still write under the old one.
-2. Roll out `encryption_key <new> <old>` to every instance. All of them now write under the new key.
-
-While an old key is listed, every object that is read and turns out to be under an old key is stored again under the current one. Each rewrite is logged:
+The first key encrypts everything that is written, and every key is tried when reading. An object that is read and turns out to be under an old key is stored again under the current one, and each rewrite is logged:
 
 ```json
 {"level":"info","logger":"caddy.storage.s3","msg":"re-encrypted object under the current encryption key","key":"caddy-certs/acme/.../admin.key"}
 ```
 
-The rewrite is a conditional write (`If-Match` on the version that was read), so it never replaces what another instance stored in the meantime, and it needs no lock. If it fails, the read still succeeds and the object is tried again the next time it is read.
+The rewrite is a conditional write (`If-Match` on the version that was read). It needs no lock and never replaces what another instance stored in the meantime.
 
-Keep the old key in the list until everything has been rewritten. Caddy reads the certificates it manages when it starts and its ACME account when it obtains or renews one, so what is in use moves to the new key quickly; an object Caddy never reads, such as the certificate of a site that is no longer configured, stays under the old key until it is cleaned up as expired. Remove the old key when the rewrites have stopped appearing in the log and nothing you still need predates the rotation.
+Instances that share a bucket need two rollouts, because an instance that only has the old key cannot read what another one wrote under the new key:
 
-While step 2 is being rolled out to instances that share a bucket, the ones still on step 1 treat the new key as the old one and may rewrite objects back; that settles once every instance is on step 2.
+1. Roll out `<old> <new>` to every instance. All of them read both keys and still write under the old one.
+2. Roll out `<new> <old>` to every instance. All of them write under the new key.
 
-### Keeping the key in a file
+Until step 2 has reached every instance, the ones still on step 1 may rewrite objects back under the old key. That settles once all are on step 2.
 
-`encryption_key_file` takes the paths of files instead of the keys themselves. Each file holds one key. As with `encryption_key`, the first one encrypts and the rest are old keys:
+Remove the old key when rewrites have stopped appearing in the log. Objects Caddy never reads, such as the certificate of a site that is no longer configured, stay under the old key until they are cleaned up as expired.
 
-```caddyfile
-encryption_key_file "/run/secrets/caddy-cert-key" "/run/secrets/caddy-cert-key-old"
-```
-
-- A file holds one key as it would be written for `encryption_key`: `echo "base64:$(openssl rand -base64 32)" > /etc/caddy/cert.key`. One line ending at the end of the file is ignored.
-- A file of exactly 32 bytes is the key itself, whatever the bytes are, so the raw output of `openssl rand -out /etc/caddy/cert.key 32` works as well.
-- The files are read once, when Caddy starts or reloads its config. Reload Caddy after changing a file.
-- Only the user Caddy runs as should be able to read the files (`chmod 600`).
-- `encryption_key_file` cannot be combined with `encryption_key` or `encryption_key_ssm`.
-
-### Keeping the key in SSM Parameter Store
-
-`encryption_key_ssm` takes the names (or ARNs) of [AWS Systems Manager Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html) parameters instead of the keys themselves. Each parameter holds one key as it would be written for `encryption_key`, preferably as a `SecureString`. As with `encryption_key`, the first one encrypts and the rest are old keys:
+### Key in a file
 
 ```caddyfile
-encryption_key_ssm "/caddy/cert-encryption-key-2026-11" "/caddy/cert-encryption-key"
+encryption_key_file "/run/secrets/caddy-cert-key"
 ```
 
-Creating one:
+- The file holds one key, written as for `encryption_key`. A line ending at the end of the file is ignored.
+- A file of exactly 32 bytes is used as the key itself, so the raw output of `openssl rand -out <file> 32` works as well.
+- Only the user Caddy runs as should be able to read the file (`chmod 600`).
+
+### Key in SSM Parameter Store
+
+```caddyfile
+encryption_key_ssm "/caddy/cert-encryption-key"
+```
+
+Each parameter holds one key, written as for `encryption_key`, preferably as a `SecureString`:
 
 ```sh
 aws ssm put-parameter --type SecureString --name /caddy/cert-encryption-key \
   --value "base64:$(openssl rand -base64 32)"
 ```
 
-A version or label of a single parameter works as well, which makes rotation a matter of writing a new version:
+- Parameters are named by name or ARN, and read with the region and credentials configured for the bucket. A parameter given by ARN is read from the region in its ARN.
+- A version or label works too, which makes rotation a matter of writing a new version: `encryption_key_ssm "/caddy/cert-encryption-key:2" "/caddy/cert-encryption-key:1"`.
+- The identity Caddy runs as needs `ssm:GetParameter` on the parameters, and `kms:Decrypt` if the SecureString uses a customer managed KMS key.
+- Keys are only read from AWS itself, over verified TLS. `endpoint`, `insecure` and endpoint overrides such as `AWS_ENDPOINT_URL` do not apply to SSM.
+- With keys in SSM, `insecure` covers the bucket connection only, so the credentials that can read the keys are fetched over verified connections too.
 
-```caddyfile
-encryption_key_ssm "/caddy/cert-encryption-key:2" "/caddy/cert-encryption-key:1"
-```
-
-- The parameters are read with the region and credentials configured for the bucket (`region`, `access_key`/`secret_key`, `profile`, `role_arn`, or the default chain). A parameter given by ARN is read from the region in its ARN.
-- The identity Caddy runs as needs `ssm:GetParameter` on the parameters, and `kms:Decrypt` on the KMS key if the SecureString uses a customer managed key.
-- The parameters are read once, when Caddy starts or reloads its config. Reload Caddy after changing a parameter.
-- `encryption_key_ssm` cannot be combined with `encryption_key` or `encryption_key_file`.
-- `endpoint` and `insecure` do not apply here: the keys are always read from AWS, over a verified connection.
-
-## What is an S3-compatible service?
+## S3-compatible services
 
 The service must support:
 
 - v4 signatures
 - GetObject, PutObject, DeleteObject, HeadObject and ListObjectsV2
-- conditional writes on PutObject (`If-None-Match: *` and `If-Match`), which the cross-instance lock and the re-encryption of objects under an old key rely on
+- conditional writes on PutObject (`If-None-Match: *` and `If-Match`), which the cross-instance lock and key rotation rely on
 
 ## Development
 
@@ -244,7 +204,7 @@ make lint       # golangci-lint v2
 make fmt        # gofumpt
 ```
 
-CI runs the tests with the race detector on the two current Go releases, and the linter, on every push and pull request. There is nothing to build or release: the plugin is compiled into Caddy by `xcaddy`.
+CI runs the tests with the race detector on the two current Go releases, and the linter. There is nothing to build or release: the plugin is compiled into Caddy by `xcaddy`.
 
 ## Credits & thanks
 
@@ -258,4 +218,4 @@ Thank you. The fork exists only to ship fixes faster, not because anything was w
 
 ## License
 
-[Apache 2.0](LICENSE), the same as the projects it is forked from. The changes made in this fork are listed under [What is fixed and added here](#what-is-fixed-and-added-here).
+[Apache 2.0](LICENSE), the same as the projects it is forked from. The changes made in this fork are listed under [What is fixed and added](#what-is-fixed-and-added).

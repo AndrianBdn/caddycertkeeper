@@ -1,7 +1,6 @@
 package caddycertkeeper
 
 import (
-	"bytes"
 	"context"
 	"net/http/httptest"
 	"path/filepath"
@@ -10,15 +9,21 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 func parseCaddyfile(input string) (*S3, error) {
 	s := new(S3)
 	return s, s.UnmarshalCaddyfile(caddyfile.NewTestDispenser(input))
+}
+
+// parseBlock parses a storage block that names a bucket and has the given
+// lines after it.
+func parseBlock(lines string) (*S3, error) {
+	return parseCaddyfile("s3 {\n\tbucket b\n" + lines + "\n}")
 }
 
 func TestCaddyfileOptions(t *testing.T) {
@@ -47,7 +52,7 @@ func TestCaddyfileOptions(t *testing.T) {
 
 func TestCaddyfileDefaults(t *testing.T) {
 	t.Run("region and prefix", func(t *testing.T) {
-		s, err := parseCaddyfile("s3 {\n\tbucket b\n}")
+		s, err := parseBlock("")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -57,7 +62,7 @@ func TestCaddyfileDefaults(t *testing.T) {
 	})
 
 	t.Run("a custom endpoint means path style", func(t *testing.T) {
-		s, err := parseCaddyfile("s3 {\n\tbucket b\n\tendpoint https://minio.example.com\n\tuse_path_style false\n}")
+		s, err := parseBlock("endpoint https://minio.example.com\nuse_path_style false")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,7 +72,7 @@ func TestCaddyfileDefaults(t *testing.T) {
 	})
 
 	t.Run("host becomes the endpoint", func(t *testing.T) {
-		s, err := parseCaddyfile("s3 {\n\tbucket b\n\thost minio.example.com\n}")
+		s, err := parseBlock("host minio.example.com")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -77,7 +82,7 @@ func TestCaddyfileDefaults(t *testing.T) {
 	})
 
 	t.Run("an empty encryption key means none", func(t *testing.T) {
-		s, err := parseCaddyfile("s3 {\n\tbucket b\n\tencryption_key \"\"\n}")
+		s, err := parseBlock(`encryption_key ""`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -87,8 +92,8 @@ func TestCaddyfileDefaults(t *testing.T) {
 	})
 }
 
-// What used to be skipped without a word is refused: an option that is not
-// applied is worse than a config that does not load.
+// An option that is silently not applied is worse than a config that does
+// not load.
 func TestCaddyfileMistakesAreRejected(t *testing.T) {
 	block := func(lines string) string { return "s3 {\n\tbucket b\n" + lines + "\n}" }
 	for name, input := range map[string]string{
@@ -230,9 +235,7 @@ func TestProvisionRegion(t *testing.T) {
 			}
 
 			// The region in use is the one that is logged.
-			var buf bytes.Buffer
-			logger := zap.New(zapcore.NewCore(
-				zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), zapcore.AddSync(&buf), zapcore.DebugLevel))
+			logger, buf := bufferLogger()
 			logger.Info("storage", zap.Any("storage", s))
 			if !strings.Contains(buf.String(), `"region":"`+tt.want+`"`) {
 				t.Errorf("logged storage does not name region %q: %s", tt.want, buf.String())
@@ -269,7 +272,7 @@ func TestProvisionedStorageWorks(t *testing.T) {
 
 func TestInsecureReachesAnEndpointWithAnUntrustedCertificate(t *testing.T) {
 	isolateAWSEnv(t)
-	f := &fakeS3{t: t, objects: make(map[string]*fakeObject), pageSize: 1000}
+	f := newFakeBucket(t)
 	srv := httptest.NewTLSServer(f)
 	t.Cleanup(srv.Close)
 
@@ -319,29 +322,92 @@ func TestInsecureKeepsTheRestOfTheTransport(t *testing.T) {
 	}
 }
 
-// The encryption keys come from AWS whatever the bucket's endpoint is, and
-// 'insecure' must not reach that connection.
-func TestInsecureDoesNotApplyToSSM(t *testing.T) {
+// skipsVerify reports whether an SDK HTTP client has certificate
+// verification switched off. No client at all means the SDK's default one.
+func skipsVerify(t *testing.T, client any) bool {
+	t.Helper()
+	if client == nil {
+		return false
+	}
+	bc, ok := client.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("HTTP client is a %T", client)
+	}
+	tls := bc.GetTransport().TLSClientConfig
+	return tls != nil && tls.InsecureSkipVerify
+}
+
+// With the keys in SSM, 'insecure' is for the bucket connection alone:
+// neither the SSM client nor the calls that fetch credentials, which are
+// made with the shared config's client, skip verification.
+func TestInsecureWithKeysInSSMCoversOnlyTheBucket(t *testing.T) {
+	isolateAWSEnv(t)
+	s := &S3{
+		Logger: zap.NewNop(), Bucket: "b", Region: "us-east-1", Insecure: true,
+		RoleARN: "arn:aws:iam::123456789012:role/caddy", EncryptionKeySSM: []string{"/caddy/key"},
+	}
+	cfg, err := s.loadAWSConfig(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !skipsVerify(t, s.newS3Client(cfg).Options().HTTPClient) {
+		t.Error("'insecure' did not reach the S3 client")
+	}
+	if skipsVerify(t, s.newSSMClient(cfg).Options().HTTPClient) {
+		t.Error("'insecure' reached the SSM client")
+	}
+	if skipsVerify(t, cfg.HTTPClient) {
+		t.Error("'insecure' reached the client that credentials are fetched with")
+	}
+}
+
+// Without keys in SSM, 'insecure' covers the credential calls as well, as
+// it does in certmagic-s3.
+func TestInsecureWithoutSSMCoversCredentialCalls(t *testing.T) {
 	isolateAWSEnv(t)
 	s := &S3{Logger: zap.NewNop(), Bucket: "b", Region: "us-east-1", Insecure: true, AccessKey: "id", SecretKey: "secret"}
 	cfg, err := s.loadAWSConfig(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !skipsVerify(t, s.newS3Client(cfg).Options().HTTPClient) || !skipsVerify(t, cfg.HTTPClient) {
+		t.Error("'insecure' did not reach the S3 client and the credential calls")
+	}
+}
 
-	skipsVerify := func(client any) bool {
-		t.Helper()
-		bc, ok := client.(*awshttp.BuildableClient)
-		if !ok {
-			t.Fatalf("HTTP client is a %T", client)
-		}
-		tls := bc.GetTransport().TLSClientConfig
-		return tls != nil && tls.InsecureSkipVerify
-	}
-	if !skipsVerify(s.newS3Client(cfg).Options().HTTPClient) {
-		t.Error("'insecure' did not reach the S3 client")
-	}
-	if skipsVerify(s.newSSMClient(cfg).Options().HTTPClient) {
-		t.Error("'insecure' reached the SSM client")
+// The keys are read from AWS itself, whatever endpoint the environment
+// points the SDK at.
+func TestSSMIgnoresEndpointOverrides(t *testing.T) {
+	for _, env := range []string{"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SSM"} {
+		t.Run(env, func(t *testing.T) {
+			isolateAWSEnv(t)
+			t.Setenv(env, "http://127.0.0.1:9000")
+
+			s := &S3{Logger: zap.NewNop(), Bucket: "b", Region: "eu-central-1", EncryptionKeySSM: []string{"/caddy/key"}}
+			cfg, err := s.loadAWSConfig(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The override is real: a client built the plain way follows it.
+			if plain := ssm.NewFromConfig(cfg).Options().BaseEndpoint; aws.ToString(plain) != "http://127.0.0.1:9000" {
+				t.Fatalf("a plain SSM client has endpoint %q; the override is not in effect", aws.ToString(plain))
+			}
+
+			opts := s.newSSMClient(cfg).Options()
+			endpoint, err := opts.EndpointResolverV2.ResolveEndpoint(context.Background(), ssm.EndpointParameters{
+				Region:       aws.String(opts.Region),
+				UseDualStack: aws.Bool(false),
+				UseFIPS:      aws.Bool(false),
+				Endpoint:     opts.BaseEndpoint,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := endpoint.URI.String(); got != "https://ssm.eu-central-1.amazonaws.com" {
+				t.Errorf("SSM endpoint = %q, want AWS's own", got)
+			}
+		})
 	}
 }
