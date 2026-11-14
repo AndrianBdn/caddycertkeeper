@@ -92,9 +92,30 @@ An S3-compatible provider with static credentials:
 }
 ```
 
+### Environment variables
+
+Any option can take its value from the environment with Caddy's [`{$VAR}` substitution](https://caddyserver.com/docs/caddyfile/concepts#environment-variables). `{$VAR:default}` gives a default for when the variable is unset.
+
+```caddyfile
+{
+  storage s3 {
+    bucket "{$CERT_BUCKET}"
+    region "{$AWS_REGION:eu-central-1}"
+    encryption_key "base64:{$CERT_KEY}"
+  }
+}
+```
+
+- **Encryption key:** use the `base64:` form shown above. See [Key in an environment variable](#key-in-an-environment-variable) for why.
+- **Credentials:** these need no option. The AWS SDK reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_PROFILE` by itself.
+- **Region:** in a Caddyfile, `AWS_REGION` is not picked up by itself, because `region` defaults to `us-east-1`. Pass it on as above.
+- **Bucket:** an unset variable leaves `bucket` empty, which is an error.
+
 ### JSON config
 
 The options have the same names. Old keys go in `old_encryption_keys`, and `encryption_key_file` and `encryption_key_ssm` are lists.
+
+`{$VAR}` is a Caddyfile feature. A JSON config gets no substitution, and `{env.VAR}` placeholders are not expanded. To keep the key out of a JSON config, use `encryption_key_file` or `encryption_key_ssm`.
 
 Three defaults differ from the Caddyfile. They are the same as in certmagic-s3, so that existing JSON setups keep finding their objects:
 
@@ -157,6 +178,21 @@ Instances that share a bucket need two rollouts, because an instance that only h
 Until step 2 has reached every instance, the ones still on step 1 may rewrite objects back under the old key. That settles once all are on step 2.
 
 Remove the old key when rewrites have stopped appearing in the log. Objects Caddy never reads, such as the certificate of a site that is no longer configured, stay under the old key until they are cleaned up as expired.
+
+### Key in an environment variable
+
+Put the output of `openssl rand -base64 32` in the variable, without `base64:`, and write the prefix in the Caddyfile:
+
+```caddyfile
+encryption_key "base64:{$CERT_KEY}"
+```
+
+- **An unset variable is an error.** Caddy refuses the config with `encryption key must be the base64 of exactly 32 bytes, got 0`.
+- **Do not put the whole key in the variable** and write `encryption_key "{$CERT_KEY}"`. If the variable is ever unset, the option is empty, and objects are stored in plain text without any error.
+- **A 32-character key** cannot take the prefix. Write it without quotes, `encryption_key {$CERT_KEY}`, which is an error when the variable is unset.
+- **Rotation** works the same way: `encryption_key "base64:{$CERT_KEY}" "base64:{$CERT_KEY_OLD}"`.
+
+The substituted key becomes part of the adapted config: `caddy adapt` prints it, the admin API returns it, and Caddy saves it to disk with the rest of its last config. A key in a file or in SSM stays out of all three.
 
 ### Key in a file
 
