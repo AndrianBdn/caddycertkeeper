@@ -117,6 +117,12 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 		return err
 	}
 	s3.setupEncryption(keys)
+
+	// With old keys configured, a rotation is under way: bring what Caddy
+	// does not read by itself under the current key too.
+	if len(keys) > 1 {
+		go s3.sweepAfter(ctx, sweepDelay)
+	}
 	return nil
 }
 
@@ -325,33 +331,61 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 		)
 	}()
 
-	input := &s3sdk.GetObjectInput{
+	buf, _, err := s3.read(ctx, key)
+	return buf, err
+}
+
+// keyState is what reading an object found out about the key it is under.
+type keyState int
+
+const (
+	// keyUnknown: the object could not be read.
+	keyUnknown keyState = iota
+	// gone: there is no such object.
+	gone
+	// underCurrentKey: nothing to do. Also every object of a clear text
+	// storage.
+	underCurrentKey
+	// rewritten: it was under an old key and is now under the current one.
+	rewritten
+	// underOldKey: it is under an old key, and rewriting it failed.
+	underOldKey
+	// changedSinceRead: it was under an old key, and another instance
+	// replaced or removed it before it could be rewritten.
+	changedSinceRead
+)
+
+// read returns the data of the object at key, and brings the object under
+// the current encryption key if it was under an old one. A missing object
+// is fs.ErrNotExist.
+func (s3 *S3) read(ctx context.Context, key string) ([]byte, keyState, error) {
+	objName := s3.objName(key)
+
+	result, err := s3.Client.GetObject(ctx, &s3sdk.GetObjectInput{
 		Bucket: aws.String(s3.Bucket),
 		Key:    aws.String(objName),
-	}
-
-	result, err := s3.Client.GetObject(ctx, input)
+	})
 	if err != nil {
 		var nsk *types.NoSuchKey
 		if errors.As(err, &nsk) {
-			return nil, fs.ErrNotExist
+			return nil, gone, fs.ErrNotExist
 		}
-		return nil, fmt.Errorf("failed to load key %s: %w", key, err)
+		return nil, keyUnknown, fmt.Errorf("failed to load key %s: %w", key, err)
 	}
 	defer func() { _ = result.Body.Close() }()
 
 	stored, err := io.ReadAll(result.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
+		return nil, keyUnknown, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
 	}
-	buf, underOldKey, err := s3.iowrap.Open(stored)
+	buf, old, err := s3.iowrap.Open(stored)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
+		return nil, keyUnknown, fmt.Errorf("failed to read/decrypt data for key %s: %w", key, err)
 	}
-	if underOldKey {
-		s3.reencrypt(ctx, objName, buf, aws.ToString(result.ETag))
+	if !old {
+		return buf, underCurrentKey, nil
 	}
-	return buf, nil
+	return buf, s3.reencrypt(ctx, objName, buf, aws.ToString(result.ETag)), nil
 }
 
 // reencrypt stores an object that was just read under an old encryption key
@@ -361,26 +395,29 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 // write and that instance's version stands. No lock is needed for that.
 //
 // It is best effort. The caller has its data either way, and an object that
-// was not rewritten is tried again the next time it is loaded.
-func (s3 *S3) reencrypt(ctx context.Context, objName string, plain []byte, etag string) {
+// was not rewritten is tried again the next time it is read.
+func (s3 *S3) reencrypt(ctx context.Context, objName string, plain []byte, etag string) keyState {
 	if etag == "" {
 		// Without the ETag the write could not be made conditional, and an
 		// unconditional one could undo another instance's write.
 		s3.Logger.Debug("not re-encrypting object: storage returned no ETag for it", zap.String("key", objName))
-		return
+		return underOldKey
 	}
 
 	err := s3.putObject(ctx, objName, plain, aws.String(etag))
 	switch {
 	case err == nil:
 		s3.Logger.Info("re-encrypted object under the current encryption key", zap.String("key", objName))
+		return rewritten
 	case isPreconditionFailed(err) || isNotFound(err):
 		s3.Logger.Debug("not re-encrypting object: it changed since it was read", zap.String("key", objName))
+		return changedSinceRead
 	default:
 		s3.Logger.Warn("re-encrypting object under the current encryption key failed",
 			zap.String("key", objName),
 			zap.Error(err),
 		)
+		return underOldKey
 	}
 }
 
@@ -598,8 +635,11 @@ func (s3 *S3) objDirName(key string) string {
 	return s3.objName(key) + "/"
 }
 
+// lockSuffix ends the name of every lock object.
+const lockSuffix = ".lock"
+
 func (s3 *S3) objLockName(key string) string {
-	return s3.objName(key) + ".lock"
+	return s3.objName(key) + lockSuffix
 }
 
 // CertMagicStorage converts s to a certmagic.Storage instance.

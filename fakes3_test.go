@@ -38,6 +38,18 @@ type fakeS3 struct {
 	// what another instance did between a reader's GET and its next request.
 	afterGet func(key string)
 
+	// afterList runs after a listing is answered, as afterGet does after a
+	// GET.
+	afterList func()
+
+	// denyPut refuses every PUT, as a service does for credentials that may
+	// only read.
+	denyPut bool
+
+	// noETag leaves the ETag out of the answer to a GET, as a service that
+	// does not return one would.
+	noETag bool
+
 	// ignoreDeleteIfMatch deletes regardless of If-Match, as services that
 	// do not support conditional deletes do.
 	ignoreDeleteIfMatch bool
@@ -120,6 +132,10 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		if f.denyPut {
+			writeError(w, http.StatusForbidden, "AccessDenied")
+			return
+		}
 		if r.Header.Get("If-None-Match") == "*" && exists {
 			writeError(w, http.StatusPreconditionFailed, "PreconditionFailed")
 			return
@@ -144,7 +160,9 @@ func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "NoSuchKey")
 			return
 		}
-		w.Header().Set("ETag", obj.etag)
+		if !f.noETag || r.Method == http.MethodHead {
+			w.Header().Set("ETag", obj.etag)
+		}
 		w.Header().Set("Last-Modified", obj.modified.UTC().Format(http.TimeFormat))
 		w.Header().Set("Content-Length", fmt.Sprint(len(obj.body)))
 		w.WriteHeader(http.StatusOK)
@@ -247,6 +265,9 @@ func (f *fakeS3) list(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/xml")
 	if err := xml.NewEncoder(w).Encode(result); err != nil {
 		f.t.Errorf("fake s3: encoding listing: %v", err)
+	}
+	if f.afterList != nil {
+		f.afterList()
 	}
 }
 

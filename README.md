@@ -26,7 +26,7 @@ Change the build, not the config or the bucket:
 What you will notice after the switch:
 
 - **Expired certificates get deleted.** The first storage clean removes certificates that expired more than two weeks ago, with their private keys. certmagic-s3 never removed them.
-- **A different ACME account may be picked.** With no account email configured and several accounts in the bucket, CertMagic now uses the most recently used one, as it does on disk.
+- **A different ACME account may be picked.** With no account email configured and several accounts in the bucket, CertMagic now uses the most recently written one, as it does on disk.
 - **Config mistakes are errors.** A Caddyfile option with no value, with too many values, or an unknown word on its own line fails with the line number. A bare `insecure` used to do nothing; write `insecure true`. A JSON config without `bucket` fails too.
 - **`host` works in JSON.** A JSON config with `host` and no `endpoint` now talks to that host. Before, `host` was ignored there and requests went to AWS.
 
@@ -36,7 +36,7 @@ Compared to certmagic-s3 v1.5.0:
 
 - **Secrets stay out of the log.** CertMagic logs its storage on every storage clean. With certmagic-s3 that line contains `access_key`, `secret_key` and `encryption_key` in plain text ([certmagic-s3#28](https://github.com/techknowlogick/certmagic-s3/issues/28)).
 - **Folder listings work.** certmagic-s3 answered every folder listing with all the files below it, so expired certificates were never cleaned up and ECH configs were regenerated on every reload ([certmagic-s3#26](https://github.com/techknowlogick/certmagic-s3/pull/26)). Listing, `Stat`, `Exists` and `Delete` now behave like CertMagic's own file storage.
-- **Key rotation.** `encryption_key` takes the current key followed by old ones, and objects are re-encrypted as they are read. See [Rotating the key](#rotating-the-key).
+- **Key rotation.** `encryption_key` takes the current key followed by old ones. Objects are re-encrypted as they are read, and a sweep at startup covers the ones Caddy does not read, then logs when no object is left under an old key. See [Rotating the key](#rotating-the-key).
 - **Stronger keys.** A key can be 32 random bytes written as `base64:...`, not only 32 characters of text. See [Generating a key](#generating-a-key).
 - **Keys from a file or from AWS SSM Parameter Store**, so the key is not in the config. See [Key in a file](#key-in-a-file) and [Key in SSM Parameter Store](#key-in-ssm-parameter-store).
 - **Config mistakes are reported**, not silently skipped.
@@ -177,7 +177,27 @@ Instances that share a bucket need two rollouts, because an instance that only h
 
 Until step 2 has reached every instance, the ones still on step 1 may rewrite objects back under the old key. That settles once all are on step 2.
 
-Remove the old key when rewrites have stopped appearing in the log. Objects Caddy never reads, such as the certificate of a site that is no longer configured, stay under the old key until they are cleaned up as expired.
+#### Removing the old key
+
+Caddy does not read everything by itself. It loads the ACME account only when it issues or renews a certificate, which can be two months away, and it never loads the private key of a site that is no longer configured. So while old keys are configured, the plugin reads every object under `prefix` once each time Caddy loads its config. It does so in the background, starting ten seconds after the config is loaded, and logs the result:
+
+```json
+{"level":"info","logger":"caddy.storage.s3","msg":"re-encryption sweep finished","objects":42,"rewritten":7,"left_under_old_keys":0,"unreadable":0,"duration":1.83}
+```
+
+Remove the old key when `left_under_old_keys` and `unreadable` are both 0.
+
+With several instances, a result only counts if its sweep started after the last process that had the old key first has exited, one that is still draining connections included. Such a process rewrites what it reads back under the old key. The sweep also runs in step 1, where the key listed second is the new one, so a result logged then says nothing about the old key. The simplest way: when step 2 is complete everywhere, run `caddy reload --force` on one instance and go by the result it logs.
+
+- `left_under_old_keys` counts objects that are under an old key and could not be rewritten: the write failed, the service returned no ETag to make the write conditional on, or another instance kept replacing the object. Each is named in a warning.
+- `unreadable` counts objects that could not be fetched, that no configured key opens, or whose name the storage cannot address, such as `caddy-certs//site.crt`. Each is named in a warning, with the error if there is one. An object no key opens stays that way whatever is done with the old key; decide what it is before removing the key.
+- A sweep that cannot list the bucket logs `re-encryption sweep failed: listing the storage` and no result.
+- A sweep that is interrupted by a reload or a shutdown logs `re-encryption sweep stopped before it finished` and no result. What it rewrote stays rewritten, and the next one, after a restart or a `caddy reload --force`, starts from the beginning.
+- The sweep costs one listing and one GET per object under `prefix`. A JSON config without a `prefix` has the whole bucket as its storage, so the sweep reads the whole bucket. It does not read lock objects.
+
+Do not remove the old key earlier. An object that is still under it becomes unreadable. If that is the ACME account, issuing and renewing certificates fail until the key is back in the config, or, with no account email configured, CertMagic may register a new account instead.
+
+The sweep rewrites every ACME account in the bucket within a few seconds. If no account email is configured and the bucket holds several accounts for one CA, CertMagic uses the most recently written one, which can be a different one after the sweep. Set `email` in the Caddyfile to pin the account.
 
 ### Key in an environment variable
 
